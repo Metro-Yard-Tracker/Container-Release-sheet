@@ -34,10 +34,8 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        // Extract React hooks from global React object
         const { useState, useEffect } = React;
 
-        // Firebase Configuration (Replace with your project keys or defaults to local sync)
         const firebaseConfig = {
             apiKey: "AIzaSyD-PlaceholderKey-ChangeMeForProduction",
             authDomain: "empty-container-tracker.firebaseapp.com",
@@ -56,7 +54,6 @@
         const DAYS_OF_WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
         const DOOR_OPTIONS = ['REAR', 'FRONT', 'PASSENGER', 'DRIVERS', 'ANY'];
 
-        // Helper: Convert various time formats to 24-hour string (e.g. 1430)
         function formatTo24Hour(val) {
             if (!val) return '';
             const s = String(val).trim();
@@ -85,7 +82,6 @@
                 setTimeout(() => setToast({ show: false, message: '', type: 'success' }), 3500);
             };
 
-            // Sync with Firebase Realtime Database
             useEffect(() => {
                 const dataRef = db.ref('releaseTrackerData');
                 dataRef.on('value', (snapshot) => {
@@ -119,7 +115,7 @@
                 db.ref('releaseTrackerData').set(payload);
             };
 
-            // Excel File Import with dynamic banner & header skipping for any daily workbook
+            // Robust Excel File Import handling daily sheets
             const handleFileUpload = (e) => {
                 const file = e.target.files[0];
                 if (!file) return;
@@ -127,8 +123,8 @@
                 const reader = new FileReader();
                 reader.onload = (evt) => {
                     try {
-                        const bstr = evt.target.result;
-                        const wb = XLSX.read(bstr, { type: 'binary' });
+                        const data = new Uint8Array(evt.target.result);
+                        const wb = XLSX.read(data, { type: 'array' });
                         const importedData = { ...releaseData };
 
                         wb.SheetNames.forEach(sheetName => {
@@ -139,12 +135,12 @@
                             if (json.length > 0) {
                                 const rows = [];
                                 
-                                // Dynamically find the header row index (where column labels like 'Customer' or 'Booking' reside)
-                                let dataStartIndex = 3; // Default fallback to row index 3 (4th row)
-                                for (let i = 0; i < Math.min(json.length, 6); i++) {
-                                    const rowStr = JSON.stringify(json[i]).toLowerCase();
+                                // Locate true header index by searching for 'customer' or 'booking'
+                                let dataStartIndex = 3; // Default fallback after 3-row banner
+                                for (let i = 0; i < Math.min(json.length, 12); i++) {
+                                    const rowStr = JSON.stringify(json[i] || []).toLowerCase();
                                     if (rowStr.includes('customer') || rowStr.includes('booking') || rowStr.includes('line #')) {
-                                        dataStartIndex = i + 1; // Start reading data immediately after the header row
+                                        dataStartIndex = i + 1;
                                         break;
                                     }
                                 }
@@ -153,31 +149,31 @@
                                     const r = json[i];
                                     if (!r || r.length === 0) continue;
 
-                                    const customerVal = String(r[1] || '').trim();
-                                    const bookingVal = String(r[4] || '').trim();
+                                    // Extract fields safely across potential column offsets
+                                    const customerVal = String(r[1] || r[2] || '').trim();
+                                    const bookingVal = String(r[4] || r[5] || '').trim();
                                     
-                                    // Skip if row is entirely empty or is a repeated header/dropdown artifact
-                                    if (!customerVal && !bookingVal && !r[3] && !r[6]) continue;
+                                    if (!customerVal && !bookingVal) continue;
+                                    
                                     const lowerCust = customerVal.toLowerCase();
-                                    if (lowerCust.includes('customer') || lowerCust.includes('line #') || lowerCust.includes('00:01')) continue;
+                                    if (lowerCust.includes('customer') || lowerCust.includes('line #') || lowerCust.includes('00:01') || lowerCust.includes('to')) continue;
 
-                                    // If not admin, skip completely blank unassigned rows
                                     if (!isAdmin && !customerVal && !bookingVal) continue;
 
-                                    const ctnVal = String(r[6] || '').trim();
+                                    const ctnVal = String(r[6] || r[7] || '').trim();
                                     rows.push({
                                         id: `imp_${matchedDay}_${i}_${Date.now()}`,
                                         lineNum: rows.length + 1,
                                         customer: customerVal,
-                                        units: Number(r[2]) || 1,
-                                        type: r[3] || '20GP',
+                                        units: Number(r[2] || r[3]) || 1,
+                                        type: String(r[3] || r[4] || '20GP').trim(),
                                         booking: bookingVal,
-                                        exGrid: String(r[5] || ''),
+                                        exGrid: String(r[5] || r[6] || '').trim(),
                                         ctnReleased: ctnVal,
-                                        truckId: String(r[7] || ''),
-                                        time: formatTo24Hour(r[8]),
-                                        doors: DOOR_OPTIONS.includes(String(r[9]).toUpperCase()) ? String(r[9]).toUpperCase() : 'ANY',
-                                        comments: String(r[10] || ''),
+                                        truckId: String(r[7] || r[8] || '').trim(),
+                                        time: formatTo24Hour(r[8] || r[9]),
+                                        doors: DOOR_OPTIONS.includes(String(r[9] || r[10]).toUpperCase()) ? String(r[9] || r[10]).toUpperCase() : 'ANY',
+                                        comments: String(r[10] || r[11] || '').trim(),
                                         status: ctnVal ? 'Released' : 'Pending'
                                     });
                                 }
@@ -193,7 +189,7 @@
                         triggerToast('Failed to parse Excel workbook', 'error');
                     }
                 };
-                reader.readAsBinaryString(file);
+                reader.readAsArrayBuffer(file);
             };
 
             const handleExportExcel = () => {
@@ -233,22 +229,17 @@
                 }
             };
 
-            // Field update handler with auto-timestamping and broadcast highlight
             const handleFieldChange = (rowId, field, value) => {
                 const currentRows = releaseData[activeTab] || [];
                 const updatedRows = currentRows.map(row => {
                     if (row.id === rowId) {
                         const updated = { ...row, [field]: value };
-                        
-                        // Auto-timestamp logic when door is selected
                         if (field === 'doors' && value && value !== 'ANY' && !updated.time) {
                             const now = new Date();
                             const hh = String(now.getHours()).padStart(2, '0');
                             const mm = String(now.getMinutes()).padStart(2, '0');
                             updated.time = hh + mm;
                         }
-
-                        // Status sync
                         if (field === 'ctnReleased') {
                             updated.status = value.trim() ? 'Released' : 'Pending';
                         }
@@ -327,14 +318,12 @@
 
             return (
                 <div className="w-full max-w-[1920px] mx-auto p-4 md:p-6">
-                    {/* Toast Notification */}
                     {toast.show && (
                         <div className={`fixed top-5 right-5 z-50 px-5 py-3 rounded-xl shadow-2xl text-white font-medium flex items-center space-x-2 transition-all duration-300 ${toast.type === 'success' ? 'bg-emerald-600' : 'bg-rose-600'}`}>
                             <span>{toast.message}</span>
                         </div>
                     )}
 
-                    {/* Header Bar */}
                     <header className="flex flex-col md:flex-row justify-between items-center bg-slate-800/90 backdrop-blur border border-slate-700/60 p-4 rounded-2xl shadow-xl mb-6 gap-4">
                         <div className="flex items-center space-x-3">
                             <div className="bg-emerald-500/20 text-emerald-400 p-3 rounded-xl">
@@ -347,7 +336,6 @@
                         </div>
 
                         <div className="flex flex-wrap items-center gap-3">
-                            {/* Search Bar */}
                             <div className="relative">
                                 <input
                                     type="text"
@@ -358,7 +346,6 @@
                                 />
                             </div>
 
-                            {/* Excel Import/Export Buttons */}
                             <label className="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded-xl text-sm font-medium cursor-pointer transition shadow flex items-center space-x-2">
                                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
                                 <span>Import Excel</span>
@@ -370,7 +357,6 @@
                                 <span>Export</span>
                             </button>
 
-                            {/* Admin Unlock */}
                             {isAdmin ? (
                                 <button onClick={() => { setIsAdmin(false); triggerToast('Locked back to standard user mode', 'success'); }} className="bg-rose-500/20 text-rose-400 border border-rose-500/40 px-4 py-2 rounded-xl text-sm font-medium transition flex items-center space-x-2">
                                     <span>Admin Mode ON</span>
@@ -383,7 +369,6 @@
                         </div>
                     </header>
 
-                    {/* Day Navigation Tabs */}
                     <div className="flex overflow-x-auto space-x-2 pb-3 mb-6 scrollbar-thin">
                         {DAYS_OF_WEEK.map(day => {
                             const count = (releaseData[day] || []).length;
@@ -401,7 +386,6 @@
                         })}
                     </div>
 
-                    {/* Main Content Table Container */}
                     <div className="bg-slate-800/80 backdrop-blur border border-slate-700/80 rounded-2xl shadow-2xl overflow-hidden">
                         <div className="p-4 bg-slate-800/90 border-b border-slate-700 flex justify-between items-center">
                             <h2 className="text-lg font-bold text-white flex items-center space-x-2">
@@ -567,7 +551,6 @@
                         </div>
                     </div>
 
-                    {/* Admin PIN Modal */}
                     {adminPinModal && (
                         <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
                             <div className="bg-slate-800 border border-slate-700 p-6 rounded-2xl w-full max-w-sm shadow-2xl">
@@ -590,7 +573,6 @@
                         </div>
                     )}
 
-                    {/* Comment Expander Modal */}
                     {commentModal.show && (
                         <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
                             <div className="bg-slate-800 border border-slate-700 p-6 rounded-2xl w-full max-w-lg shadow-2xl">
