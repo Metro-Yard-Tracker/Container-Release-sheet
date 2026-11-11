@@ -116,87 +116,81 @@
             };
 
             // Robust Excel File Import handling daily sheets
-            const handleFileUpload = (e) => {
-                const file = e.target.files[0];
-                if (!file) return;
+        const handleFileUpload = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
 
-                const reader = new FileReader();
-                reader.onload = (evt) => {
-                    try {
-                        const data = new Uint8Array(evt.target.result);
-                        const wb = XLSX.read(data, { type: 'array' });
-                        const importedData = { ...releaseData };
-                        let totalImportedCount = 0;
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+                try {
+                    const data = new Uint8Array(evt.target.result);
+                    const wb = XLSX.read(data, { type: 'array' });
+                    const importedData = { ...releaseData };
+                    let totalImportedCount = 0;
 
-                        console.log("Workbook sheets found:", wb.SheetNames);
+                    wb.SheetNames.forEach(sheetName => {
+                        const matchedDay = DAYS_OF_WEEK.find(d => d.toLowerCase() === sheetName.toLowerCase()) || sheetName;
+                        const ws = wb.Sheets[sheetName];
+                        const json = XLSX.utils.sheet_to_json(ws, { header: 1 });
 
-                        wb.SheetNames.forEach(sheetName => {
-                            const matchedDay = DAYS_OF_WEEK.find(d => d.toLowerCase() === sheetName.toLowerCase()) || sheetName;
-                            const ws = wb.Sheets[sheetName];
-                            const json = XLSX.utils.sheet_to_json(ws, { header: 1 });
+                        if (json.length > 0) {
+                            const rows = [];
+                            
+                            // Start reading strictly at row index 3 (Excel Row 4 where actual data begins)
+                            // Rows 0, 1, 2 are title banners and headers.
+                            const startIndex = Math.min(3, json.length);
 
-                            console.log(`Processing sheet: ${sheetName} (Matched Day: ${matchedDay}), Total rows: ${json.length}`);
+                            for (let i = startIndex; i < json.length; i++) {
+                                const r = json[i];
+                                if (!r || r.length === 0) continue;
 
-                            if (json.length > 0) {
-                                const rows = [];
+                                const customerVal = String(r[1] || '').trim();
+                                const bookingVal = String(r[4] || '').trim();
                                 
-                                // Reliable data start index: Row 4 in Excel is index 3 (0-indexed)
-                                // Let's inspect starting from index 3 (Excel row 4)
-                                const dataStartIndex = Math.min(3, json.length - 1);
-
-                                for (let i = dataStartIndex; i < json.length; i++) {
-                                    const r = json[i];
-                                    if (!r || r.length === 0) continue;
-
-                                    // Extract fields robustly across columns
-                                    // Col A (index 0) is line number, Col B/C (index 1 or 2) is Customer
-                                    const customerVal = String(r[1] || r[2] || '').trim();
-                                    const bookingVal = String(r[4] || r[5] || '').trim();
-                                    
-                                    // Skip rows that are empty or contain header title fragments
-                                    if (!customerVal && !bookingVal) continue;
-                                    
-                                    const lowerCust = customerVal.toLowerCase();
-                                    if (lowerCust.includes('customer') || lowerCust.includes('line #') || lowerCust.includes('00:01') || lowerCust.includes('to') || lowerCust.includes('type')) {
-                                        continue;
-                                    }
-
-                                    const ctnVal = String(r[6] || r[7] || '').trim();
-                                    rows.push({
-                                        id: `imp_${matchedDay}_${i}_${Date.now()}`,
-                                        lineNum: rows.length + 1,
-                                        customer: customerVal,
-                                        units: Number(r[2] || r[3]) || 1,
-                                        type: String(r[3] || r[4] || '20GP').trim(),
-                                        booking: bookingVal,
-                                        exGrid: String(r[5] || r[6] || '').trim(),
-                                        ctnReleased: ctnVal,
-                                        truckId: String(r[7] || r[8] || '').trim(),
-                                        time: formatTo24Hour(r[8] || r[9]),
-                                        doors: DOOR_OPTIONS.includes(String(r[9] || r[10]).toUpperCase()) ? String(r[9] || r[10]).toUpperCase() : 'ANY',
-                                        comments: String(r[10] || r[11] || '').trim(),
-                                        status: ctnVal ? 'Released' : 'Pending'
-                                    });
-                                    totalImportedCount++;
+                                // Skip completely empty rows
+                                if (!customerVal && !bookingVal) continue;
+                                
+                                // Skip any accidental header repetition
+                                const lowerCust = customerVal.toLowerCase();
+                                if (lowerCust.includes('customer') || lowerCust.includes('line #') || lowerCust.includes('00:01')) {
+                                    continue;
                                 }
-                                importedData[matchedDay] = rows;
+
+                                const ctnVal = String(r[6] || '').trim();
+                                rows.push({
+                                    id: `imp_${matchedDay}_${i}_${Date.now()}`,
+                                    lineNum: rows.length + 1,
+                                    customer: customerVal,
+                                    units: Number(r[2]) || 1,
+                                    type: String(r[3] || '20GP').trim(),
+                                    booking: bookingVal,
+                                    exGrid: String(r[5] || '').trim(),
+                                    ctnReleased: ctnVal,
+                                    truckId: String(r[7] || '').trim(),
+                                    time: formatTo24Hour(r[8]),
+                                    doors: DOOR_OPTIONS.includes(String(r[9]).toUpperCase()) ? String(r[9]).toUpperCase() : 'ANY',
+                                    comments: String(r[10] || '').trim(),
+                                    status: ctnVal ? 'Released' : 'Pending'
+                                });
+                                totalImportedCount++;
                             }
-                        });
+                            importedData[matchedDay] = rows;
+                        }
+                    });
 
-                        console.log("Total valid booking rows imported across all tabs:", totalImportedCount);
-                        setReleaseData(importedData);
-                        saveToFirebase(importedData);
-                        triggerToast(`Successfully imported ${totalImportedCount} bookings across all tabs!`, 'success');
-                        e.target.value = ''; // Reset file input so same file can be re-imported anytime
-                    } catch (err) {
-                        console.error("Excel parse error:", err);
-                        triggerToast('Failed to parse Excel workbook. Check console for details.', 'error');
-                    }
-                };
-                reader.readAsArrayBuffer(file);
+                    setReleaseData(importedData);
+                    saveToFirebase(importedData);
+                    triggerToast(`Successfully imported ${totalImportedCount} bookings!`, 'success');
+                    e.target.value = '';
+                } catch (err) {
+                    console.error("Excel parse error:", err);
+                    triggerToast('Failed to parse Excel workbook.', 'error');
+                }
             };
+            reader.readAsArrayBuffer(file);
+        };
 
-            const handleExportExcel = () => {
+        const handleExportExcel = () => {
                 try {
                     const wb = XLSX.utils.book_new();
                     DAYS_OF_WEEK.forEach(day => {
