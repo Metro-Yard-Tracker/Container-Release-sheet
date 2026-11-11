@@ -752,9 +752,9 @@
                       <th className="py-3.5 px-3 w-32">Booking #</th>
                       <th className="py-3.5 px-3 w-24 text-center">Ex Grid</th>
                       <th className="py-3.5 px-3 w-52">Ctn # Released</th>
-                      <th className="py-3.5 px-3 w-44">Truck ID</th>
-                      <th className="py-3.5 px-3 w-36">Doors</th>
-                      <th className="py-3.5 px-3 w-32 text-center">Time (24h)</th>
+                      <th className="py-3.5 px-3 min-w-[200px]">Truck ID</th>
+                      <th className="py-3.5 px-3 min-w-[160px]">Doors</th>
+                      <th className="py-3.5 px-3 min-w-[140px] text-center">Time (24h)</th>
                       <th className="py-3.5 px-3 min-w-[240px]">Comment / Special Instructions</th>
                       <th className="py-3.5 px-3 w-28 text-center">Status</th>
                       {isAdmin && <th className="py-3.5 px-3 w-12 text-center">Action</th>}
@@ -880,7 +880,7 @@
                                 value={row.truckId}
                                 onFocus={() => handleCellFocusOrType(row.id)}
                                 onChange={(e) => handleCellEdit(row.id, 'truckId', e.target.value)}
-                                className="w-full bg-cellbg border border-slate-700 rounded-lg px-3.5 py-1.5 text-sm text-slate-100 font-mono-num font-semibold placeholder-slate-500 focus:outline-none focus:border-emerald-500"
+                                className="w-full bg-cellbg border border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-100 font-mono-num font-semibold placeholder-slate-500 focus:outline-none focus:border-emerald-500"
                               />
                             </td>
 
@@ -889,7 +889,7 @@
                                 value={row.doors || 'ANY'}
                                 onFocus={() => handleCellFocusOrType(row.id)}
                                 onChange={(e) => handleCellEdit(row.id, 'doors', e.target.value)}
-                                className="w-full bg-cellbg border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-100 font-bold focus:outline-none focus:border-emerald-500"
+                                className="w-full bg-cellbg border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 font-bold focus:outline-none focus:border-emerald-500"
                               >
                                 {DOOR_OPTIONS.map(opt => (
                                   <option key={opt} value={opt}>{opt}</option>
@@ -906,7 +906,7 @@
                                 onFocus={() => handleCellFocusOrType(row.id)}
                                 onChange={(e) => handleCellEdit(row.id, 'time', e.target.value)}
                                 onBlur={(e) => handleCellEdit(row.id, 'time', e.target.value)}
-                                className="w-full bg-cellbg border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-100 font-mono-num font-bold text-center placeholder-slate-500 focus:outline-none focus:border-emerald-500"
+                                className="w-full bg-cellbg border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 font-mono-num font-bold text-center placeholder-slate-500 focus:outline-none focus:border-emerald-500"
                               />
                             </td>
 
