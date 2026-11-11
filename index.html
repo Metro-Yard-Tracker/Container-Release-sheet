@@ -142,7 +142,6 @@
         db.ref("container_release").set(payload);
       };
 
-      // Helper to generate current 24-hr time (HHmm)
       const getCurrent24HrTime = () => {
         const now = new Date();
         const hours = String(now.getHours()).padStart(2, "0");
@@ -157,16 +156,17 @@
         return cleaned;
       };
 
+      // Check if a row has any valid content
       const isRowValid = (row) => {
         if (!row) return false;
         return (
-          (row.customer && row.customer.trim() !== "") ||
-          (row.bookingNo && row.bookingNo.trim() !== "") ||
-          (row.type && row.type.trim() !== "") ||
-          (row.exGrid && row.exGrid.trim() !== "") ||
-          (row.ctnReleased && row.ctnReleased.trim() !== "") ||
-          (row.truckId && row.truckId.trim() !== "") ||
-          (row.comment && row.comment.trim() !== "")
+          (row.customer && row.customer.toString().trim() !== "") ||
+          (row.bookingNo && row.bookingNo.toString().trim() !== "") ||
+          (row.type && row.type.toString().trim() !== "") ||
+          (row.exGrid && row.exGrid.toString().trim() !== "") ||
+          (row.ctnReleased && row.ctnReleased.toString().trim() !== "") ||
+          (row.truckId && row.truckId.toString().trim() !== "") ||
+          (row.comment && row.comment.toString().trim() !== "")
         );
       };
 
@@ -176,7 +176,7 @@
 
         let autoTime = updatedDayData[rowIndex].time;
 
-        // Auto-populate 24-hr time when container number is added
+        // Auto-populate time when container number is added
         if (field === "ctnReleased" && value.trim() !== "" && (!autoTime || autoTime.trim() === "")) {
           autoTime = getCurrent24HrTime();
         }
@@ -250,7 +250,7 @@
       };
 
       const handleDragStart = (e, index) => {
-        if (userRole !== "Admin") return; // Reordering restricted to Admin
+        if (userRole !== "Admin") return;
         setDraggedRowIndex(index);
         e.dataTransfer.effectAllowed = "move";
       };
@@ -283,6 +283,7 @@
         setDragOverRowIndex(null);
       };
 
+      // Improved Multi-Tab Excel Import Handler
       const handleImportExcel = (e) => {
         const file = e.target.files[0];
         if (!file) return;
@@ -292,10 +293,19 @@
           const data = new Uint8Array(evt.target.result);
           const workbook = XLSX.read(data, { type: "array" });
 
-          const newSheetData = { ...sheetData };
+          const newSheetData = {
+            Monday: [],
+            Tuesday: [],
+            Wednesday: [],
+            Thursday: [],
+            Friday: [],
+            Saturday: [],
+            Sunday: []
+          };
           const newHeaderMeta = { ...headerMetadata };
 
           workbook.SheetNames.forEach((sheetName) => {
+            // Fuzzy match day names from sheet names like "Monday 9th "
             const matchedDay = DAYS.find((d) => sheetName.toLowerCase().includes(d.toLowerCase()));
             if (matchedDay) {
               const worksheet = workbook.Sheets[sheetName];
@@ -330,6 +340,9 @@
           setSheetData(newSheetData);
           setHeaderMetadata(newHeaderMeta);
           saveToFirebase(newSheetData, newHeaderMeta);
+
+          // Clear file input value to allow re-importing the same file
+          e.target.value = "";
         };
         reader.readAsArrayBuffer(file);
       };
@@ -377,7 +390,6 @@
       };
 
       const currentDayRows = (sheetData[activeDay] || []).filter((r) => isRowValid(r) || r.isNew);
-
       const isAdmin = userRole === "Admin";
 
       return (
@@ -393,7 +405,7 @@
             </div>
 
             <div className="flex items-center gap-3">
-              {/* Mode Switcher */}
+              {/* Role Switcher */}
               <div className="bg-gray-950 p-1 rounded-lg border border-gray-800 flex items-center text-xs">
                 <button
                   onClick={() => setUserRole("General User")}
@@ -549,7 +561,7 @@
                     currentDayRows.map((row, idx) => {
                       const isDragged = draggedRowIndex === idx;
                       const isDragOver = dragOverRowIndex === idx;
-                      const gridKey = (row.exGrid || "").trim().toUpperCase();
+                      const gridKey = (row.exGrid || "").toString().trim().toUpperCase();
                       const gridColorStyle = GRID_COLOR_MAP[gridKey] || DEFAULT_GRID_STYLE;
 
                       return (
@@ -568,7 +580,7 @@
                             {idx + 1}
                           </td>
 
-                          {/* Read-Only for General Users: Customer */}
+                          {/* Customer */}
                           <td className="py-2.5 px-3">
                             {isAdmin ? (
                               <input
@@ -583,7 +595,7 @@
                             )}
                           </td>
 
-                          {/* Read-Only for General Users: Units */}
+                          {/* Units */}
                           <td className="py-2.5 px-3">
                             {isAdmin ? (
                               <input
@@ -598,7 +610,7 @@
                             )}
                           </td>
 
-                          {/* Read-Only for General Users: Type */}
+                          {/* Type */}
                           <td className="py-2.5 px-3">
                             {isAdmin ? (
                               <input
@@ -613,7 +625,7 @@
                             )}
                           </td>
 
-                          {/* Read-Only for General Users: Booking # */}
+                          {/* Booking # */}
                           <td className="py-2.5 px-3">
                             {isAdmin ? (
                               <input
@@ -628,7 +640,7 @@
                             )}
                           </td>
 
-                          {/* Read-Only for General Users: Color-Coded Ex Grid */}
+                          {/* Color-Coded Ex Grid */}
                           <td className="py-2.5 px-3">
                             {isAdmin ? (
                               <input
