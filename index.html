@@ -672,4 +672,40 @@
 
           {/* Comment Pop-out Modal */}
           {commentModal.isOpen && (
-            <div className="fixed inset-0 bg-black/70 flex
+            <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
+              <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 w-full max-w-lg shadow-2xl">
+                <h3 className="text-lg font-bold text-gray-100 mb-2">Special Instructions / Comments</h3>
+                <p className="text-xs text-gray-400 mb-4">Line #{commentModal.rowIndex + 1}</p>
+                <textarea
+                  rows={6}
+                  value={commentModal.text}
+                  onChange={(e) => setCommentModal({ ...commentModal, text: e.target.value })}
+                  className="w-full bg-gray-950 border border-gray-800 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-emerald-500 text-sm mb-4"
+                  placeholder="Enter detailed special instructions..."
+                  autoFocus
+                />
+                <div className="flex justify-end gap-3">
+                  <button
+                    onClick={() => setCommentModal({ isOpen: false, rowIndex: null, text: "" })}
+                    className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm rounded-lg"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={saveCommentModal}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm rounded-lg"
+                  >
+                    Save Comment
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById("root"));
+  </script>
+</body>
+</html>
