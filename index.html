@@ -299,16 +299,18 @@
               updatedRow.time = formatTo24Hour(value);
             }
 
+            // Status calculation: must have container number entered and truck assigned for Released
             if (field === 'ctnReleased' || field === 'truckId' || field === 'units') {
-              const hasTruck = Boolean(updatedRow.truckId && updatedRow.truckId.trim());
+              const hasCtn = Boolean(updatedRow.ctnReleased && updatedRow.ctnReleased.trim().length > 0);
+              const hasTruck = Boolean(updatedRow.truckId && updatedRow.truckId.trim().length > 0);
               const ctnCount = updatedRow.ctnReleased ? updatedRow.ctnReleased.split(',').filter(s => s.trim().length > 0).length : 0;
               
-              if (ctnCount >= updatedRow.units && hasTruck) {
-                updatedRow.status = 'Released';
-              } else if (ctnCount > 0 || hasTruck) {
-                updatedRow.status = 'In Progress';
-              } else {
+              if (!hasCtn) {
                 updatedRow.status = 'Pending';
+              } else if (ctnCount >= updatedRow.units && hasTruck) {
+                updatedRow.status = 'Released';
+              } else {
+                updatedRow.status = 'In Progress';
               }
             }
             return updatedRow;
@@ -479,6 +481,7 @@
                   const r = json[i];
                   if (!r || r.length === 0 || (!r[1] && !r[4])) continue;
 
+                  const ctnVal = String(r[6] || '').trim();
                   rows.push({
                     id: `imp_${sheetName}_${i}`,
                     lineNum: rows.length + 1,
@@ -487,12 +490,12 @@
                     type: r[3] || '20GP',
                     booking: String(r[4] || ''),
                     exGrid: String(r[5] || ''),
-                    ctnReleased: String(r[6] || ''),
+                    ctnReleased: ctnVal,
                     truckId: String(r[7] || ''),
                     time: formatTo24Hour(r[8]),
                     doors: DOOR_OPTIONS.includes(String(r[9]).toUpperCase()) ? String(r[9]).toUpperCase() : 'ANY',
                     comments: String(r[10] || ''),
-                    status: r[6] ? 'Released' : 'Pending'
+                    status: ctnVal ? 'Released' : 'Pending'
                   });
                 }
                 importedData[sheetName] = rows;
@@ -870,17 +873,6 @@
                                 onFocus={() => handleCellFocusOrType(row.id)}
                                 onChange={(e) => handleCellEdit(row.id, 'ctnReleased', e.target.value)}
                                 className="w-full bg-cellbg border border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-100 font-mono-num font-bold placeholder-slate-500 focus:outline-none focus:border-emerald-500 shadow-sm"
-                              />
-                            </td>
-
-                            <td className="py-3 px-3">
-                              <input
-                                type="text"
-                                placeholder="Truck ID"
-                                value={row.truckId}
-                                onFocus={() => handleCellFocusOrType(row.id)}
-                                onChange={(e) => handleCellEdit(row.id, 'truckId', e.target.value)}
-                                className="w-full bg-cellbg border border-slate-700 rounded-lg px-3.5 py-2 text-sm text-slate-100 font-mono-num font-semibold placeholder-slate-500 focus:outline-none focus:border-emerald-500"
                               />
                             </td>
 
