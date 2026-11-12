@@ -83,7 +83,7 @@
     const DOOR_OPTIONS = ["Forward", "Rear", "Passengers", "Drivers"];
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
     const ROW_LOCK_DURATION_MS = 5000; // 5 seconds from first character until 5 seconds after last character
-    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v6";
+    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v7";
     const LOCAL_LOCKS_STORAGE_KEY = "container_release_active_locks_v1";
     const SESSION_STORAGE_KEY = "container_release_active_user_v1";
     const DEFAULT_PIN = "1111";
@@ -140,6 +140,8 @@
     };
 
     const SCHEDULE_FIELDS = ["customer", "units", "type", "bookingNo", "exGrid"];
+    const YARD_FIELDS = ["ctnReleased", "truckId", "time", "doors", "comment"];
+    const ALL_COMPARABLE_FIELDS = [...SCHEDULE_FIELDS, ...YARD_FIELDS];
 
     const SNAPSHOT_COLUMNS = [
       { key: "customer", label: "Customer" },
@@ -234,7 +236,7 @@
     const normKey = (v) => normStr(v).toLowerCase();
 
     // =========================================================================
-    // BOOKING-FIRST IMPORT COMPARISON ENGINE (NEVER SWALLOWS NEW BOOKING LINES)
+    // FULL 10-COLUMN IMPORT COMPARISON ENGINE (DETECTS ANY CHANGED FIELD)
     // =========================================================================
     const computeImportAnalysis = (currentDays, incomingDays) => {
       const mergedDays = createEmptyDaysObject();
@@ -244,6 +246,54 @@
         unchangedCount: 0,
         removedCount: 0,
         items: []
+      };
+
+      const buildRowDiffsAndMerge = (ex, inc) => {
+        const diffs = [];
+        ALL_COMPARABLE_FIELDS.forEach((field) => {
+          const oldVal = normStr(ex[field]);
+          const newVal = normStr(inc[field]);
+
+          if (YARD_FIELDS.includes(field)) {
+            // Only flag a yard field diff if the incoming spreadsheet actually has a value in that column
+            // AND it differs from what is currently in the app
+            if (newVal !== "" && normKey(oldVal) !== normKey(newVal)) {
+              diffs.push({
+                field,
+                label: FIELD_LABELS[field] || field,
+                oldVal: oldVal || "Empty",
+                newVal
+              });
+            }
+          } else {
+            if (normKey(oldVal) !== normKey(newVal)) {
+              diffs.push({
+                field,
+                label: FIELD_LABELS[field] || field,
+                oldVal: oldVal || "Empty",
+                newVal: newVal || "Empty"
+              });
+            }
+          }
+        });
+
+        // For Merge mode: apply schedule updates and any non-empty incoming yard fields,
+        // while keeping existing live yard entries if the incoming sheet cell is blank
+        const mergedRow = {
+          ...ex,
+          customer: normStr(inc.customer) !== "" ? inc.customer : ex.customer,
+          units: normStr(inc.units) !== "" ? inc.units : ex.units,
+          type: normStr(inc.type) !== "" ? inc.type : ex.type,
+          bookingNo: normStr(inc.bookingNo) !== "" ? inc.bookingNo : ex.bookingNo,
+          exGrid: normStr(inc.exGrid) !== "" ? inc.exGrid : ex.exGrid,
+          ctnReleased: normStr(inc.ctnReleased) !== "" ? inc.ctnReleased : ex.ctnReleased,
+          truckId: normStr(inc.truckId) !== "" ? inc.truckId : ex.truckId,
+          time: normStr(inc.time) !== "" ? inc.time : ex.time,
+          doors: normStr(inc.doors) !== "" ? inc.doors : ex.doors,
+          comment: normStr(inc.comment) !== "" ? inc.comment : ex.comment
+        };
+
+        return { diffs, mergedRow };
       };
 
       DAYS.forEach((day) => {
@@ -262,8 +312,36 @@
         const usedIncomingIndices = new Set();
         const updatedExistingMap = new Map();
 
+        const registerMatch = (exIdx, incIdx) => {
+          usedExistingIndices.add(exIdx);
+          usedIncomingIndices.add(incIdx);
+
+          const ex = existingRows[exIdx];
+          const inc = incomingRows[incIdx];
+          const { diffs, mergedRow } = buildRowDiffsAndMerge(ex, inc);
+
+          if (diffs.length > 0) {
+            updatedExistingMap.set(exIdx, { updatedRow: mergedRow, diffs });
+            summary.updatedCount += 1;
+            summary.items.push({
+              type: "updated",
+              day,
+              lineNo: exIdx + 1,
+              customer: mergedRow.customer,
+              bookingNo: mergedRow.bookingNo,
+              exGrid: mergedRow.exGrid,
+              ctnReleased: mergedRow.ctnReleased,
+              truckId: mergedRow.truckId,
+              diffs
+            });
+          } else {
+            summary.unchangedCount += 1;
+          }
+        };
+
         // Pass 1: Exact composite match (Customer + Booking # + Type + ExGrid)
         incomingRows.forEach((inc, incIdx) => {
+          if (usedIncomingIndices.has(incIdx)) return;
           const incCust = normKey(inc.customer);
           const incBkg = normKey(inc.bookingNo);
           const incType = normKey(inc.type);
@@ -279,54 +357,10 @@
             );
           });
 
-          if (matchIdx !== -1) {
-            usedExistingIndices.add(matchIdx);
-            usedIncomingIndices.add(incIdx);
-
-            const ex = existingRows[matchIdx];
-            const diffs = [];
-            SCHEDULE_FIELDS.forEach((field) => {
-              const oldVal = normStr(ex[field]);
-              const newVal = normStr(inc[field]);
-              if (oldVal !== newVal) {
-                diffs.push({
-                  field,
-                  label: FIELD_LABELS[field] || field,
-                  oldVal: oldVal || "Empty",
-                  newVal: newVal || "Empty"
-                });
-              }
-            });
-
-            if (diffs.length > 0) {
-              const mergedRow = {
-                ...ex,
-                customer: inc.customer || ex.customer,
-                units: inc.units || ex.units,
-                type: inc.type || ex.type,
-                bookingNo: inc.bookingNo || ex.bookingNo,
-                exGrid: inc.exGrid || ex.exGrid
-              };
-              updatedExistingMap.set(matchIdx, { updatedRow: mergedRow, diffs });
-              summary.updatedCount += 1;
-              summary.items.push({
-                type: "updated",
-                day,
-                lineNo: matchIdx + 1,
-                customer: mergedRow.customer,
-                bookingNo: mergedRow.bookingNo,
-                exGrid: mergedRow.exGrid,
-                ctnReleased: mergedRow.ctnReleased,
-                truckId: mergedRow.truckId,
-                diffs
-              });
-            } else {
-              summary.unchangedCount += 1;
-            }
-          }
+          if (matchIdx !== -1) registerMatch(matchIdx, incIdx);
         });
 
-        // Pass 2: Match on same Booking # + Customer (handles updated Ex Grid, # Units, or Type on an existing booking)
+        // Pass 2: Match on same Booking # + Customer (catches changed Ex Grid, # Units, Type, Truck ID, Time, Ctn #, Doors, Comment)
         incomingRows.forEach((inc, incIdx) => {
           if (usedIncomingIndices.has(incIdx)) return;
           const incCust = normKey(inc.customer);
@@ -338,56 +372,73 @@
             return normKey(ex.customer) === incCust && normKey(ex.bookingNo) === incBkg;
           });
 
-          if (matchIdx !== -1) {
-            usedExistingIndices.add(matchIdx);
-            usedIncomingIndices.add(incIdx);
+          if (matchIdx !== -1) registerMatch(matchIdx, incIdx);
+        });
 
-            const ex = existingRows[matchIdx];
-            const diffs = [];
-            SCHEDULE_FIELDS.forEach((field) => {
-              const oldVal = normStr(ex[field]);
-              const newVal = normStr(inc[field]);
-              if (oldVal !== newVal) {
-                diffs.push({
-                  field,
-                  label: FIELD_LABELS[field] || field,
-                  oldVal: oldVal || "Empty",
-                  newVal: newVal || "Empty"
-                });
-              }
-            });
+        // Pass 3: Match on Customer + Type + ExGrid + (Ctn # or Truck ID) when the Booking # itself was edited
+        incomingRows.forEach((inc, incIdx) => {
+          if (usedIncomingIndices.has(incIdx)) return;
+          const incCust = normKey(inc.customer);
+          const incType = normKey(inc.type);
+          const incGrid = normKey(inc.exGrid);
+          const incCtn = normKey(inc.ctnReleased);
+          const incTruck = normKey(inc.truckId);
 
-            const mergedRow = {
-              ...ex,
-              customer: inc.customer,
-              units: inc.units,
-              type: inc.type,
-              bookingNo: inc.bookingNo,
-              exGrid: inc.exGrid
-            };
+          if (!incCust) return;
 
-            if (diffs.length > 0) {
-              updatedExistingMap.set(matchIdx, { updatedRow: mergedRow, diffs });
-              summary.updatedCount += 1;
-              summary.items.push({
-                type: "updated",
-                day,
-                lineNo: matchIdx + 1,
-                customer: mergedRow.customer,
-                bookingNo: mergedRow.bookingNo,
-                exGrid: mergedRow.exGrid,
-                ctnReleased: mergedRow.ctnReleased,
-                truckId: mergedRow.truckId,
-                diffs
-              });
-            } else {
-              summary.unchangedCount += 1;
+          const matchIdx = existingRows.findIndex((ex, exIdx) => {
+            if (usedExistingIndices.has(exIdx)) return false;
+            const sameCustomerAndSpec =
+              normKey(ex.customer) === incCust &&
+              normKey(ex.type) === incType &&
+              normKey(ex.exGrid) === incGrid;
+            if (!sameCustomerAndSpec) return false;
+
+            const ctnMatches = incCtn !== "" && normKey(ex.ctnReleased) === incCtn;
+            const truckMatches = incTruck !== "" && normKey(ex.truckId) === incTruck;
+            return ctnMatches || truckMatches;
+          });
+
+          if (matchIdx !== -1) registerMatch(matchIdx, incIdx);
+        });
+
+        // Pass 4: 1-to-1 same-position match ONLY if both rows have identical Customer + Type + ExGrid
+        // AND the counts of unmatched rows for that exact Customer+Type+Grid are equal (prevents swallowing a newly added line)
+        incomingRows.forEach((inc, incIdx) => {
+          if (usedIncomingIndices.has(incIdx)) return;
+          if (incIdx >= existingRows.length || usedExistingIndices.has(incIdx)) return;
+
+          const ex = existingRows[incIdx];
+          const sameSignature =
+            normKey(ex.customer) !== "" &&
+            normKey(ex.customer) === normKey(inc.customer) &&
+            normKey(ex.type) === normKey(inc.type) &&
+            normKey(ex.exGrid) === normKey(inc.exGrid);
+
+          if (sameSignature) {
+            const unmatchedExistingWithSig = existingRows.filter(
+              (r, idx) =>
+                !usedExistingIndices.has(idx) &&
+                normKey(r.customer) === normKey(inc.customer) &&
+                normKey(r.type) === normKey(inc.type) &&
+                normKey(r.exGrid) === normKey(inc.exGrid)
+            ).length;
+
+            const unmatchedIncomingWithSig = incomingRows.filter(
+              (r, idx) =>
+                !usedIncomingIndices.has(idx) &&
+                normKey(r.customer) === normKey(inc.customer) &&
+                normKey(r.type) === normKey(inc.type) &&
+                normKey(r.exGrid) === normKey(inc.exGrid)
+            ).length;
+
+            if (unmatchedExistingWithSig === unmatchedIncomingWithSig) {
+              registerMatch(incIdx, incIdx);
             }
           }
         });
 
-        // Build merged list for this day:
-        // All existing lines stay intact (with schedule updates applied where matched, preserving Ctn/Truck/Time/Doors/Comments)
+        // Build merged list for this day
         const dayMergedList = existingRows.map((ex, exIdx) => {
           if (!usedExistingIndices.has(exIdx)) {
             summary.removedCount += 1;
@@ -409,7 +460,7 @@
           return { ...ex };
         });
 
-        // Every unmatched incoming line is guaranteed to be treated as a + New Line
+        // Every remaining unmatched incoming line is guaranteed to be treated as a + New Line
         incomingRows.forEach((inc, incIdx) => {
           if (!usedIncomingIndices.has(incIdx)) {
             const newLineObj = {
@@ -427,6 +478,9 @@
               typeCode: inc.type,
               bookingNo: inc.bookingNo,
               exGrid: inc.exGrid,
+              ctnReleased: inc.ctnReleased,
+              truckId: inc.truckId,
+              time: inc.time,
               comment: inc.comment
             });
           }
@@ -2562,6 +2616,12 @@
                                   {item.exGrid}
                                 </span>
                               )}
+                              {item.ctnReleased && (
+                                <span className="font-mono text-emerald-300">Ctn: {item.ctnReleased}</span>
+                              )}
+                              {item.truckId && (
+                                <span className="font-mono text-gray-300">Truck: {item.truckId}</span>
+                              )}
                             </div>
                             <span className="text-emerald-400/90 text-[11px]">
                               Will be added to {item.day}
@@ -2585,14 +2645,9 @@
                                   {item.day} Line #{item.lineNo}
                                 </span>
                                 <span className="text-white font-bold">{item.customer}</span>
-                                {item.ctnReleased && (
-                                  <span className="font-mono text-emerald-300 bg-emerald-950/70 px-2 py-0.5 rounded border border-emerald-800/50">
-                                    Keeps Ctn: {item.ctnReleased}
-                                  </span>
-                                )}
-                                {item.truckId && (
+                                {item.bookingNo && (
                                   <span className="font-mono text-gray-300 bg-gray-900 px-2 py-0.5 rounded border border-gray-800">
-                                    Keeps Truck: {item.truckId}
+                                    Bkg: {item.bookingNo}
                                   </span>
                                 )}
                               </div>
