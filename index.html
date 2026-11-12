@@ -71,6 +71,7 @@
     ];
 
     const DOOR_OPTIONS = ["Forward", "Rear", "Passengers", "Drivers"];
+    const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
     // AV Grid Color Palette
     const GRID_COLOR_MAP = {
@@ -88,6 +89,19 @@
       ["", "", "", "", "", "", "", "", "", "", ""],
       ["", "Customer", "# Units", "Type", "Booking #", "Ex Grid", "Ctn # Released", "Truck id", "Time", "Doors", "Comment/Special Instructions"]
     ];
+
+    const FIELD_LABELS = {
+      customer: "Customer",
+      units: "# Units",
+      type: "Type",
+      bookingNo: "Booking #",
+      exGrid: "Ex Grid",
+      ctnReleased: "Ctn # Released",
+      truckId: "Truck ID",
+      time: "Time",
+      doors: "Doors",
+      comment: "Comment"
+    };
 
     function App() {
       const [activeDay, setActiveDay] = useState("Monday");
@@ -116,7 +130,24 @@
       const [draggedRowIndex, setDraggedRowIndex] = useState(null);
       const [dragOverRowIndex, setDragOverRowIndex] = useState(null);
       const [commentModal, setCommentModal] = useState({ isOpen: false, rowIndex: null, text: "" });
+      
+      // 7-Day Rolling Log & Snapshot State
+      const [activityLogs, setActivityLogs] = useState([]);
+      const [importSnapshots, setImportSnapshots] = useState([]);
+      const [isLogModalOpen, setIsLogModalOpen] = useState(false);
+      const [logModalTab, setLogModalTab] = useState("edits"); // "edits" or "snapshots"
+      const [logSearchQuery, setLogSearchQuery] = useState("");
+      
+      // Track previous snapshot on initial load to avoid duplicate log entries
+      const initialLoadSnapshotRef = useRef({});
       const fileInputRef = useRef(null);
+
+      // Filter helper for 7-day rolling retention
+      const pruneOlderThanSevenDays = (items) => {
+        if (!Array.isArray(items)) return [];
+        const cutoff = Date.now() - SEVEN_DAYS_MS;
+        return items.filter((item) => item && item.timestamp && item.timestamp >= cutoff);
+      };
 
       // Realtime Database sync
       useEffect(() => {
@@ -124,22 +155,63 @@
         releaseRef.on("value", (snapshot) => {
           const val = snapshot.val();
           if (val) {
-            if (val.daysData) setSheetData(val.daysData);
+            if (val.daysData) {
+              setSheetData(val.daysData);
+              initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(val.daysData));
+            }
             if (val.headerMetadata) setHeaderMetadata(val.headerMetadata);
             if (val.notification !== undefined) setNotification(val.notification);
+            if (val.activityLogs) setActivityLogs(pruneOlderThanSevenDays(val.activityLogs));
+            if (val.importSnapshots) setImportSnapshots(pruneOlderThanSevenDays(val.importSnapshots));
           }
         });
         return () => releaseRef.off();
       }, []);
 
-      const saveToFirebase = (newData, newHeaders, newNotice) => {
+      const saveToFirebase = (overrides = {}) => {
+        const prunedLogs = pruneOlderThanSevenDays(
+          overrides.activityLogs !== undefined ? overrides.activityLogs : activityLogs
+        );
+        const prunedSnapshots = pruneOlderThanSevenDays(
+          overrides.importSnapshots !== undefined ? overrides.importSnapshots : importSnapshots
+        );
+
         const payload = {
-          daysData: newData !== undefined ? newData : sheetData,
-          headerMetadata: newHeaders !== undefined ? newHeaders : headerMetadata,
-          notification: newNotice !== undefined ? newNotice : notification,
+          daysData: overrides.daysData !== undefined ? overrides.daysData : sheetData,
+          headerMetadata: overrides.headerMetadata !== undefined ? overrides.headerMetadata : headerMetadata,
+          notification: overrides.notification !== undefined ? overrides.notification : notification,
+          activityLogs: prunedLogs,
+          importSnapshots: prunedSnapshots,
           lastUpdated: new Date().toISOString()
         };
         db.ref("container_release").set(payload);
+      };
+
+      const formatLogTimestamp = (ms) => {
+        const d = new Date(ms);
+        const day = String(d.getDate()).padStart(2, "0");
+        const month = d.toLocaleString("en-NZ", { month: "short" });
+        const hrs = String(d.getHours()).padStart(2, "0");
+        const mins = String(d.getMinutes()).padStart(2, "0");
+        return `${day} ${month} ${hrs}${mins}`;
+      };
+
+      const createLogEntry = (day, lineNo, action, details, meta = {}) => {
+        const now = Date.now();
+        return {
+          id: `${now}-${Math.random().toString(36).substr(2, 5)}`,
+          timestamp: now,
+          formattedTime: formatLogTimestamp(now),
+          day,
+          lineNo,
+          role: userRole,
+          action,
+          details,
+          customer: meta.customer || "",
+          bookingNo: meta.bookingNo || "",
+          ctnReleased: meta.ctnReleased || "",
+          truckId: meta.truckId || ""
+        };
       };
 
       const getCurrent24HrTime = () => {
@@ -156,7 +228,6 @@
         return cleaned;
       };
 
-      // Check if a row has any valid content
       const isRowValid = (row) => {
         if (!row) return false;
         return (
@@ -203,8 +274,13 @@
         const updatedDayData = [...(sheetData[activeDay] || [])];
         if (!updatedDayData[rowIndex]) return;
 
+        const targetRow = updatedDayData[rowIndex];
+        const prevRowSnapshot = (initialLoadSnapshotRef.current[activeDay] || [])[rowIndex] || {};
+        const oldVal = (prevRowSnapshot[field] || "").toString().trim();
+        const newVal = (finalValue || "").toString().trim();
+
         updatedDayData[rowIndex] = {
-          ...updatedDayData[rowIndex],
+          ...targetRow,
           [field]: finalValue
         };
 
@@ -213,7 +289,21 @@
           [activeDay]: updatedDayData
         };
         setSheetData(newSheetData);
-        saveToFirebase(newSheetData);
+
+        let updatedLogs = activityLogs;
+        if (oldVal !== newVal) {
+          const label = FIELD_LABELS[field] || field;
+          const summary = `${label}: "${oldVal || "Empty"}" → "${newVal || "Cleared"}"`;
+          const logItem = createLogEntry(activeDay, rowIndex + 1, "Field Updated", summary, updatedDayData[rowIndex]);
+          updatedLogs = [logItem, ...pruneOlderThanSevenDays(activityLogs)];
+          setActivityLogs(updatedLogs);
+          initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
+        }
+
+        saveToFirebase({
+          daysData: newSheetData,
+          activityLogs: updatedLogs
+        });
       };
 
       const handleAddRow = () => {
@@ -234,19 +324,31 @@
         };
         const updatedList = [...currentList, newRow];
         const newSheetData = { ...sheetData, [activeDay]: updatedList };
+        const logItem = createLogEntry(activeDay, updatedList.length, "Line Added", "Added new schedule row");
+        const updatedLogs = [logItem, ...pruneOlderThanSevenDays(activityLogs)];
+
         setSheetData(newSheetData);
-        saveToFirebase(newSheetData);
+        setActivityLogs(updatedLogs);
+        initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
+        saveToFirebase({ daysData: newSheetData, activityLogs: updatedLogs });
       };
 
       const handleRemoveRow = (index) => {
         const currentList = sheetData[activeDay] || [];
+        const removedRow = currentList[index] || {};
         const updatedList = currentList.filter((_, idx) => idx !== index).map((row, idx) => ({
           ...row,
           lineNo: idx + 1
         }));
         const newSheetData = { ...sheetData, [activeDay]: updatedList };
+        const detail = `Removed line (${removedRow.customer || "No Customer"} | Booking: ${removedRow.bookingNo || "N/A"})`;
+        const logItem = createLogEntry(activeDay, index + 1, "Line Removed", detail, removedRow);
+        const updatedLogs = [logItem, ...pruneOlderThanSevenDays(activityLogs)];
+
         setSheetData(newSheetData);
-        saveToFirebase(newSheetData);
+        setActivityLogs(updatedLogs);
+        initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
+        saveToFirebase({ daysData: newSheetData, activityLogs: updatedLogs });
       };
 
       const handleDragStart = (e, index) => {
@@ -277,21 +379,52 @@
 
         const reindexed = currentList.map((item, idx) => ({ ...item, lineNo: idx + 1 }));
         const newSheetData = { ...sheetData, [activeDay]: reindexed };
+        const logItem = createLogEntry(
+          activeDay,
+          index + 1,
+          "Line Reordered",
+          `Moved line #${draggedRowIndex + 1} to #${index + 1} (${draggedItem.customer || "Row"})`,
+          draggedItem
+        );
+        const updatedLogs = [logItem, ...pruneOlderThanSevenDays(activityLogs)];
+
         setSheetData(newSheetData);
-        saveToFirebase(newSheetData);
+        setActivityLogs(updatedLogs);
+        initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
+        saveToFirebase({ daysData: newSheetData, activityLogs: updatedLogs });
         setDraggedRowIndex(null);
         setDragOverRowIndex(null);
       };
 
-      // Improved Multi-Tab Excel Import Handler
+      // Universal Multi-Tab Excel Import Handler with Automatic 7-Day Backup Snapshot
       const handleImportExcel = (e) => {
         const file = e.target.files[0];
         if (!file) return;
+        const fileName = file.name;
 
         const reader = new FileReader();
         reader.onload = (evt) => {
           const data = new Uint8Array(evt.target.result);
           const workbook = XLSX.read(data, { type: "array" });
+
+          // Check if current sheet has existing data worth backing up before overwriting
+          const hasExistingRows = DAYS.some((d) => (sheetData[d] || []).filter(isRowValid).length > 0);
+          let updatedSnapshots = pruneOlderThanSevenDays(importSnapshots);
+
+          if (hasExistingRows) {
+            const totalActiveRows = DAYS.reduce((acc, d) => acc + (sheetData[d] || []).filter(isRowValid).length, 0);
+            const now = Date.now();
+            const backupSnapshot = {
+              id: `snap-${now}`,
+              timestamp: now,
+              formattedTime: formatLogTimestamp(now),
+              label: `Auto-Backup before importing "${fileName}"`,
+              rowCount: totalActiveRows,
+              daysData: JSON.parse(JSON.stringify(sheetData)),
+              headerMetadata: JSON.parse(JSON.stringify(headerMetadata))
+            };
+            updatedSnapshots = [backupSnapshot, ...updatedSnapshots];
+          }
 
           const newSheetData = {
             Monday: [],
@@ -303,9 +436,9 @@
             Sunday: []
           };
           const newHeaderMeta = { ...headerMetadata };
+          let importedCount = 0;
 
           workbook.SheetNames.forEach((sheetName) => {
-            // Fuzzy match day names from sheet names like "Monday 9th "
             const matchedDay = DAYS.find((d) => sheetName.toLowerCase().includes(d.toLowerCase()));
             if (matchedDay) {
               const worksheet = workbook.Sheets[sheetName];
@@ -333,18 +466,77 @@
                 }))
                 .filter(isRowValid);
 
+              importedCount += parsedRows.length;
               newSheetData[matchedDay] = parsedRows;
             }
           });
 
+          const importLog = createLogEntry(
+            "All Days",
+            "-",
+            "Excel Imported",
+            `Imported "${fileName}" (${importedCount} active lines across week)`
+          );
+          const updatedLogs = [importLog, ...pruneOlderThanSevenDays(activityLogs)];
+
           setSheetData(newSheetData);
           setHeaderMetadata(newHeaderMeta);
-          saveToFirebase(newSheetData, newHeaderMeta);
+          setImportSnapshots(updatedSnapshots);
+          setActivityLogs(updatedLogs);
+          initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
 
-          // Clear file input value to allow re-importing the same file
+          saveToFirebase({
+            daysData: newSheetData,
+            headerMetadata: newHeaderMeta,
+            activityLogs: updatedLogs,
+            importSnapshots: updatedSnapshots
+          });
+
           e.target.value = "";
         };
         reader.readAsArrayBuffer(file);
+      };
+
+      // Restore a saved 7-day snapshot
+      const handleRestoreSnapshot = (snapshot) => {
+        if (!snapshot || !snapshot.daysData) return;
+
+        // Save current state first before restoring
+        const now = Date.now();
+        const currentTotal = DAYS.reduce((acc, d) => acc + (sheetData[d] || []).filter(isRowValid).length, 0);
+        const safetyBackup = {
+          id: `snap-${now}`,
+          timestamp: now,
+          formattedTime: formatLogTimestamp(now),
+          label: `Auto-Backup before restoring snapshot from ${snapshot.formattedTime}`,
+          rowCount: currentTotal,
+          daysData: JSON.parse(JSON.stringify(sheetData)),
+          headerMetadata: JSON.parse(JSON.stringify(headerMetadata))
+        };
+
+        const restoreLog = createLogEntry(
+          "All Days",
+          "-",
+          "Snapshot Restored",
+          `Restored weekly backup from ${snapshot.formattedTime} (${snapshot.rowCount} lines)`
+        );
+
+        const updatedSnapshots = [safetyBackup, ...pruneOlderThanSevenDays(importSnapshots)];
+        const updatedLogs = [restoreLog, ...pruneOlderThanSevenDays(activityLogs)];
+
+        setSheetData(snapshot.daysData);
+        if (snapshot.headerMetadata) setHeaderMetadata(snapshot.headerMetadata);
+        setImportSnapshots(updatedSnapshots);
+        setActivityLogs(updatedLogs);
+        initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(snapshot.daysData));
+
+        saveToFirebase({
+          daysData: snapshot.daysData,
+          headerMetadata: snapshot.headerMetadata || headerMetadata,
+          activityLogs: updatedLogs,
+          importSnapshots: updatedSnapshots
+        });
+        setIsLogModalOpen(false);
       };
 
       const handleExportExcel = () => {
@@ -392,6 +584,22 @@
       const currentDayRows = (sheetData[activeDay] || []).filter((r) => isRowValid(r) || r.isNew);
       const isAdmin = userRole === "Admin";
 
+      // Search filter for 7-day log tracker
+      const filteredLogs = activityLogs.filter((log) => {
+        if (!logSearchQuery.trim()) return true;
+        const q = logSearchQuery.toLowerCase();
+        return (
+          (log.day && log.day.toLowerCase().includes(q)) ||
+          (log.action && log.action.toLowerCase().includes(q)) ||
+          (log.details && log.details.toLowerCase().includes(q)) ||
+          (log.customer && log.customer.toLowerCase().includes(q)) ||
+          (log.bookingNo && log.bookingNo.toLowerCase().includes(q)) ||
+          (log.ctnReleased && log.ctnReleased.toLowerCase().includes(q)) ||
+          (log.truckId && log.truckId.toLowerCase().includes(q)) ||
+          (log.formattedTime && log.formattedTime.toLowerCase().includes(q))
+        );
+      });
+
       return (
         <div className="flex-1 flex flex-col">
           {/* Header Bar */}
@@ -404,7 +612,7 @@
               <p className="text-xs text-gray-400">Real-time Sync | Mode: <span className="font-semibold text-emerald-400">{userRole}</span></p>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-3">
               {/* Role Switcher */}
               <div className="bg-gray-950 p-1 rounded-lg border border-gray-800 flex items-center text-xs">
                 <button
@@ -425,24 +633,33 @@
                 </button>
               </div>
 
-              {isAdmin && (
-                <>
-                  <input
-                    type="file"
-                    ref={fileInputRef}
-                    onChange={handleImportExcel}
-                    accept=".xlsx, .xls"
-                    className="hidden"
-                  />
-                  <button
-                    onClick={() => fileInputRef.current.click()}
-                    className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-200 text-sm font-medium rounded-lg border border-gray-700 transition flex items-center gap-2"
-                  >
-                    <span>Import Master (.xlsx)</span>
-                  </button>
-                </>
-              )}
+              {/* 7-Day Log & Archive Button */}
+              <button
+                onClick={() => setIsLogModalOpen(true)}
+                className="px-3.5 py-2 bg-gray-800 hover:bg-gray-700 text-gray-200 text-sm font-medium rounded-lg border border-gray-700 transition flex items-center gap-2"
+              >
+                <span>7-Day Log</span>
+                <span className="text-xs bg-gray-950 text-emerald-400 px-1.5 py-0.5 rounded border border-gray-800">
+                  {activityLogs.length}
+                </span>
+              </button>
 
+              {/* Import Button Available for ALL Users */}
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleImportExcel}
+                accept=".xlsx, .xls"
+                className="hidden"
+              />
+              <button
+                onClick={() => fileInputRef.current.click()}
+                className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-200 text-sm font-medium rounded-lg border border-gray-700 transition flex items-center gap-2"
+              >
+                <span>Import Master (.xlsx)</span>
+              </button>
+
+              {/* Export Button */}
               <button
                 onClick={handleExportExcel}
                 className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium rounded-lg transition shadow-lg shadow-emerald-900/20 flex items-center gap-2"
@@ -465,7 +682,7 @@
                     if (e.key === "Enter") {
                       setNotification(tempNotice);
                       setIsEditingNotice(false);
-                      saveToFirebase(undefined, undefined, tempNotice);
+                      saveToFirebase({ notification: tempNotice });
                     }
                   }}
                   className="bg-gray-900 text-amber-100 px-3 py-1 rounded border border-amber-700 text-sm w-full focus:outline-none"
@@ -481,7 +698,7 @@
                   if (isEditingNotice) {
                     setNotification(tempNotice);
                     setIsEditingNotice(false);
-                    saveToFirebase(undefined, undefined, tempNotice);
+                    saveToFirebase({ notification: tempNotice });
                   } else {
                     setTempNotice(notification || "GXT/SH Won't be added to release sheet. Domestic should Email to Release Mtys.");
                     setIsEditingNotice(true);
@@ -554,7 +771,7 @@
                   {currentDayRows.length === 0 ? (
                     <tr>
                       <td colSpan={isAdmin ? 12 : 11} className="py-12 text-center text-gray-500">
-                        No active records for {activeDay}.
+                        No active records for {activeDay}. Click "Import Master (.xlsx)" to load a schedule.
                       </td>
                     </tr>
                   ) : (
@@ -779,6 +996,141 @@
                     className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm rounded-lg"
                   >
                     Save Comment
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 7-Day Activity Log & Archive Snapshot Modal */}
+          {isLogModalOpen && (
+            <div className="fixed inset-0 bg-black/75 flex items-center justify-center p-4 z-50">
+              <div className="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-4xl max-h-[85vh] flex flex-col shadow-2xl">
+                {/* Modal Header */}
+                <div className="px-6 py-4 border-b border-gray-800 flex items-center justify-between">
+                  <div>
+                    <h3 className="text-lg font-bold text-white">7-Day Activity Log & Weekly Snapshots</h3>
+                    <p className="text-xs text-gray-400">Records and import backups are automatically retained for 7 days.</p>
+                  </div>
+                  <button
+                    onClick={() => setIsLogModalOpen(false)}
+                    className="text-gray-400 hover:text-white text-lg px-2"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                {/* Sub-tabs & Search */}
+                <div className="px-6 py-3 bg-gray-950/60 border-b border-gray-800 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setLogModalTab("edits")}
+                      className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${
+                        logModalTab === "edits"
+                          ? "bg-emerald-600 text-white"
+                          : "bg-gray-800 text-gray-400 hover:text-gray-200"
+                      }`}
+                    >
+                      Edit History ({activityLogs.length})
+                    </button>
+                    <button
+                      onClick={() => setLogModalTab("snapshots")}
+                      className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${
+                        logModalTab === "snapshots"
+                          ? "bg-amber-600 text-white"
+                          : "bg-gray-800 text-gray-400 hover:text-gray-200"
+                      }`}
+                    >
+                      Import Backups ({importSnapshots.length})
+                    </button>
+                  </div>
+
+                  {logModalTab === "edits" && (
+                    <input
+                      type="text"
+                      value={logSearchQuery}
+                      onChange={(e) => setLogSearchQuery(e.target.value)}
+                      placeholder="Filter by Ctn #, Booking, Truck, Customer..."
+                      className="bg-gray-900 border border-gray-700 focus:border-emerald-500 rounded-lg px-3 py-1.5 text-xs text-gray-100 w-72 focus:outline-none"
+                    />
+                  )}
+                </div>
+
+                {/* Modal Content */}
+                <div className="flex-1 overflow-auto p-6">
+                  {logModalTab === "edits" ? (
+                    filteredLogs.length === 0 ? (
+                      <div className="text-center py-12 text-gray-500 text-sm">
+                        No log entries found within the last 7 days.
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {filteredLogs.map((log) => (
+                          <div
+                            key={log.id}
+                            className="bg-gray-950/80 border border-gray-800/80 rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs"
+                          >
+                            <div className="flex items-center gap-3">
+                              <span className="font-mono text-emerald-400 font-semibold whitespace-nowrap">
+                                {log.formattedTime}
+                              </span>
+                              <span className="px-2 py-0.5 rounded bg-gray-800 text-gray-300 font-medium">
+                                {log.day} {log.lineNo !== "-" ? `#${log.lineNo}` : ""}
+                              </span>
+                              <span className="text-gray-200">{log.details}</span>
+                            </div>
+                            <div className="flex items-center gap-2 text-gray-400 font-mono">
+                              {log.customer && <span>[{log.customer}]</span>}
+                              {log.bookingNo && <span>Bkg: {log.bookingNo}</span>}
+                              <span className={`px-1.5 py-0.5 rounded text-[10px] ${log.role === "Admin" ? "bg-amber-950 text-amber-300 border border-amber-800/50" : "bg-gray-900 text-gray-400 border border-gray-800"}`}>
+                                {log.role}
+                              </span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )
+                  ) : importSnapshots.length === 0 ? (
+                    <div className="text-center py-12 text-gray-500 text-sm">
+                      No backup snapshots stored yet. Whenever an Excel sheet is imported, the previous sheet is automatically backed up here for 7 days.
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {importSnapshots.map((snap) => (
+                        <div
+                          key={snap.id}
+                          className="bg-gray-950/80 border border-gray-800 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4"
+                        >
+                          <div>
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className="font-mono text-xs text-amber-400 font-semibold">
+                                {snap.formattedTime}
+                              </span>
+                              <span className="text-xs bg-gray-800 text-gray-300 px-2 py-0.5 rounded">
+                                {snap.rowCount} Total Lines
+                              </span>
+                            </div>
+                            <p className="text-sm text-gray-200">{snap.label}</p>
+                          </div>
+                          <button
+                            onClick={() => handleRestoreSnapshot(snap)}
+                            className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold rounded-lg transition"
+                          >
+                            Restore This Sheet
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Modal Footer */}
+                <div className="px-6 py-3 border-t border-gray-800 flex justify-end">
+                  <button
+                    onClick={() => setIsLogModalOpen(false)}
+                    className="px-4 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-200 text-sm rounded-lg"
+                  >
+                    Close
                   </button>
                 </div>
               </div>
