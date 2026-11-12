@@ -13,8 +13,8 @@
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   
-  <!-- SheetJS (XLSX) -->
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- SheetJS with Full Cell Style Support (xlsx-js-style) -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
   
   <!-- Firebase SDKs -->
   <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
@@ -82,7 +82,7 @@
 
     const DOOR_OPTIONS = ["Forward", "Rear", "Passengers", "Drivers"];
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v3";
+    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v4";
     const SESSION_STORAGE_KEY = "container_release_active_user_v1";
     const DEFAULT_PIN = "1111";
 
@@ -98,13 +98,22 @@
       }
     ];
 
-    // AV Grid Color Palette
+    // AV Grid Color Palette (UI)
     const GRID_COLOR_MAP = {
       "AV1": "bg-blue-950/80 text-blue-300 border-blue-700/60",
       "AV2": "bg-purple-950/80 text-purple-300 border-purple-700/60",
       "AV3": "bg-amber-950/80 text-amber-300 border-amber-700/60",
       "AV4": "bg-emerald-950/80 text-emerald-300 border-emerald-700/60",
       "AV5": "bg-rose-950/80 text-rose-300 border-rose-700/60"
+    };
+
+    // Fallback Excel RGB Hex Fills for Ex Grid if template has no explicit fill for a grid code
+    const EXCEL_GRID_FILL_FALLBACK = {
+      "AV1": "BDD7EE",
+      "AV2": "E4DFEC",
+      "AV3": "FFE699",
+      "AV4": "C6E0B4",
+      "AV5": "F8CBAD"
     };
 
     const DEFAULT_GRID_STYLE = "bg-gray-800 text-gray-300 border-gray-700";
@@ -166,6 +175,39 @@
       return normalized;
     };
 
+    // Convert ArrayBuffer to Base64 safely in chunks
+    const arrayBufferToBase64 = (buffer) => {
+      const bytes = new Uint8Array(buffer);
+      const chunkSize = 0x8000;
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        const sub = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, sub);
+      }
+      return btoa(binary);
+    };
+
+    // Convert Base64 back to Uint8Array
+    const base64ToUint8Array = (base64) => {
+      const binary = atob(base64);
+      const len = binary.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    };
+
+    // Deep clone cell style object safely
+    const cloneStyle = (styleObj) => {
+      if (!styleObj) return undefined;
+      try {
+        return JSON.parse(JSON.stringify(styleObj));
+      } catch (e) {
+        return undefined;
+      }
+    };
+
     // Smart matching and diff calculation between existing week data and newly imported Excel data
     const computeImportAnalysis = (currentDays, incomingDays) => {
       const mergedDays = createEmptyDaysObject();
@@ -191,9 +233,9 @@
 
         const usedExistingIndices = new Set();
         const usedIncomingIndices = new Set();
-        const updatedExistingMap = new Map(); // existingIdx -> { updatedRow, diffs }
+        const updatedExistingMap = new Map();
 
-        // Pass 1: Exact composite match (Customer + Booking # + Type + ExGrid)
+        // Pass 1: Exact composite match
         incomingRows.forEach((inc, incIdx) => {
           const incCust = (inc.customer || "").trim().toLowerCase();
           const incBkg = (inc.bookingNo || "").trim().toLowerCase();
@@ -257,7 +299,7 @@
           }
         });
 
-        // Pass 2: Same row position fallback (catches Booking # edits on the same line, e.g. same Customer/Type/Grid at same index)
+        // Pass 2: Same row position fallback
         incomingRows.forEach((inc, incIdx) => {
           if (usedIncomingIndices.has(incIdx)) return;
           if (incIdx < existingRows.length && !usedExistingIndices.has(incIdx)) {
@@ -316,7 +358,7 @@
           }
         });
 
-        // Pass 3: Secondary match on (Customer + Booking #) anywhere in that day (e.g. Ex Grid or Type updated)
+        // Pass 3: Secondary match on Customer + Booking #
         incomingRows.forEach((inc, incIdx) => {
           if (usedIncomingIndices.has(incIdx)) return;
           const incCust = (inc.customer || "").trim().toLowerCase();
@@ -379,8 +421,6 @@
           }
         });
 
-        // Build final merged list for this day:
-        // Keep all existing rows (with updated schedule fields where matched, preserving Ctn/Truck/Time/Doors/Comments)
         const dayMergedList = existingRows.map((ex, exIdx) => {
           if (!usedExistingIndices.has(exIdx)) {
             summary.removedCount += 1;
@@ -402,7 +442,6 @@
           return { ...ex };
         });
 
-        // Append all truly new lines from the Excel sheet
         incomingRows.forEach((inc, incIdx) => {
           if (!usedIncomingIndices.has(incIdx)) {
             dayMergedList.push({ ...inc });
@@ -460,7 +499,7 @@
       const [loginPin, setLoginPin] = useState("");
       const [loginError, setLoginError] = useState("");
 
-      // Forced Personalized PIN Setup State (when logging in with 1111)
+      // Forced Personalized PIN Setup State
       const [pendingPinSetupUser, setPendingPinSetupUser] = useState(null);
       const [newPersonalPin, setNewPersonalPin] = useState("");
       const [confirmPersonalPin, setConfirmPersonalPin] = useState("");
@@ -514,6 +553,21 @@
         return "";
       });
 
+      // Stores the Base64 binary of the exact original imported Excel workbook so colors, borders & layout are preserved on export
+      const [workbookTemplateBase64, setWorkbookTemplateBase64] = useState(() => {
+        try {
+          const cached = localStorage.getItem(LOCAL_STORAGE_KEY);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (parsed.workbookTemplateBase64) return parsed.workbookTemplateBase64;
+          }
+        } catch (e) {}
+        return "";
+      });
+
+      // Alert modal when user tries to export before importing a master sheet
+      const [isNoTemplateAlertOpen, setIsNoTemplateAlertOpen] = useState(false);
+
       // Import Comparison & Merge Modal State
       const [pendingImportReview, setPendingImportReview] = useState(null);
 
@@ -562,6 +616,10 @@
           overrides.currentWorkbookName !== undefined
             ? overrides.currentWorkbookName
             : currentWorkbookName;
+        const nextTemplateBase64 =
+          overrides.workbookTemplateBase64 !== undefined
+            ? overrides.workbookTemplateBase64
+            : workbookTemplateBase64;
 
         const payload = {
           daysData: nextDaysData,
@@ -569,6 +627,7 @@
           notification: nextNotice,
           users: nextUsers,
           currentWorkbookName: nextWorkbookName,
+          workbookTemplateBase64: nextTemplateBase64,
           activityLogs: prunedLogs,
           importSnapshots: prunedSnapshots,
           lastUpdated: new Date().toISOString()
@@ -618,6 +677,7 @@
               if (val.headerMetadata) setHeaderMetadata(val.headerMetadata);
               if (val.notification !== undefined) setNotification(val.notification);
               if (val.currentWorkbookName !== undefined) setCurrentWorkbookName(val.currentWorkbookName);
+              if (val.workbookTemplateBase64 !== undefined) setWorkbookTemplateBase64(val.workbookTemplateBase64);
               if (Array.isArray(val.users) && val.users.length > 0) {
                 setUsers(val.users);
               }
@@ -1116,8 +1176,10 @@
 
         const reader = new FileReader();
         reader.onload = (evt) => {
-          const data = new Uint8Array(evt.target.result);
-          const workbook = XLSX.read(data, { type: "array" });
+          const arrayBuffer = evt.target.result;
+          const data = new Uint8Array(arrayBuffer);
+          const incomingBase64 = arrayBufferToBase64(arrayBuffer);
+          const workbook = XLSX.read(data, { type: "array", cellStyles: true });
 
           const parsedIncomingDays = createEmptyDaysObject();
           const newHeaderMeta = { ...headerMetadata };
@@ -1159,9 +1221,9 @@
           const hasExistingRows = DAYS.some((d) => (sheetData[d] || []).filter(isRowValid).length > 0);
 
           if (!hasExistingRows) {
-            // Fresh import when sheet is currently empty
             applyImportAction("overwrite", {
               importedFileName,
+              incomingBase64,
               incomingDays: parsedIncomingDays,
               mergedDays: parsedIncomingDays,
               newHeaderMeta,
@@ -1169,10 +1231,10 @@
               summary: { addedCount: totalIncomingRows, updatedCount: 0, unchangedCount: 0, removedCount: 0, items: [] }
             });
           } else {
-            // Compute diff and show Import Comparison & Merge Modal
             const { mergedDays, summary } = computeImportAnalysis(sheetData, parsedIncomingDays);
             setPendingImportReview({
               importedFileName,
+              incomingBase64,
               incomingDays: parsedIncomingDays,
               mergedDays,
               newHeaderMeta,
@@ -1190,6 +1252,7 @@
         if (!reviewPayload) return;
         const {
           importedFileName,
+          incomingBase64,
           incomingDays,
           mergedDays,
           newHeaderMeta,
@@ -1209,6 +1272,7 @@
             timestamp: now,
             formattedTime: formatLogTimestamp(now),
             sheetName: backedUpSheetTitle,
+            workbookTemplateBase64: workbookTemplateBase64 || "",
             importedBy: currentUser ? currentUser.username : "Unknown",
             label:
               mode === "merge"
@@ -1239,6 +1303,7 @@
         setSheetData(finalDaysData);
         setHeaderMetadata(newHeaderMeta);
         setCurrentWorkbookName(importedFileName);
+        setWorkbookTemplateBase64(incomingBase64);
         setImportSnapshots(updatedSnapshots);
         setActivityLogs(updatedLogs);
         setPendingImportReview(null);
@@ -1248,6 +1313,7 @@
           daysData: finalDaysData,
           headerMetadata: newHeaderMeta,
           currentWorkbookName: importedFileName,
+          workbookTemplateBase64: incomingBase64,
           activityLogs: updatedLogs,
           importSnapshots: updatedSnapshots
         });
@@ -1264,6 +1330,7 @@
           timestamp: now,
           formattedTime: formatLogTimestamp(now),
           sheetName: currentWorkbookName || "Previous Release Sheet",
+          workbookTemplateBase64: workbookTemplateBase64 || "",
           importedBy: currentUser ? currentUser.username : "Unknown",
           label: `Backed up before restoring "${restoredSheetTitle}"`,
           rowCount: currentTotal,
@@ -1279,12 +1346,17 @@
         );
 
         const normalizedRestored = normalizeDaysData(snapshot.daysData);
+        const restoredTemplate =
+          snapshot.workbookTemplateBase64 !== undefined
+            ? snapshot.workbookTemplateBase64
+            : workbookTemplateBase64;
         const updatedSnapshots = [safetyBackup, ...pruneOlderThanSevenDays(importSnapshots)];
         const updatedLogs = [restoreLog, ...pruneOlderThanSevenDays(activityLogs)];
 
         setSheetData(normalizedRestored);
         if (snapshot.headerMetadata) setHeaderMetadata(snapshot.headerMetadata);
         setCurrentWorkbookName(restoredSheetTitle);
+        setWorkbookTemplateBase64(restoredTemplate);
         setImportSnapshots(updatedSnapshots);
         setActivityLogs(updatedLogs);
         initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(normalizedRestored));
@@ -1293,41 +1365,183 @@
           daysData: normalizedRestored,
           headerMetadata: snapshot.headerMetadata || headerMetadata,
           currentWorkbookName: restoredSheetTitle,
+          workbookTemplateBase64: restoredTemplate,
           activityLogs: updatedLogs,
           importSnapshots: updatedSnapshots
         });
         setIsLogModalOpen(false);
       };
 
+      // =======================================================================
+      // STYLE-PRESERVING EXCEL EXPORT (USES ORIGINAL IMPORTED .XLSX AS TEMPLATE)
+      // =======================================================================
       const handleExportExcel = () => {
-        const wb = XLSX.utils.book_new();
+        // If no Excel file has been imported yet, show the clear alert pop-up
+        if (!workbookTemplateBase64) {
+          setIsNoTemplateAlertOpen(true);
+          return;
+        }
 
-        DAYS.forEach((day) => {
-          const dayMeta = headerMetadata[day] || DEFAULT_HEADER_BLOCK;
-          const rowsList = (sheetData[day] || []).filter(isRowValid);
+        try {
+          const rawBytes = base64ToUint8Array(workbookTemplateBase64);
+          const wb = XLSX.read(rawBytes, { type: "array", cellStyles: true });
 
-          const sheetOutput = [
-            ...dayMeta,
-            ...rowsList.map((r, idx) => [
-              idx + 1,
-              r.customer,
-              r.units,
-              r.type,
-              r.bookingNo,
-              r.exGrid,
-              r.ctnReleased,
-              r.truckId,
-              r.time,
-              r.doors,
-              r.comment
-            ])
-          ];
+          DAYS.forEach((day) => {
+            const matchedSheetName = wb.SheetNames.find((s) =>
+              s.toLowerCase().includes(day.toLowerCase())
+            );
+            if (!matchedSheetName) return;
 
-          const ws = XLSX.utils.aoa_to_sheet(sheetOutput);
-          XLSX.utils.book_append_sheet(wb, ws, day);
-        });
+            const ws = wb.Sheets[matchedSheetName];
+            const rowsList = (sheetData[day] || []).filter(isRowValid);
+            const currentRange = XLSX.utils.decode_range(ws["!ref"] || "A1:K25");
 
-        XLSX.writeFile(wb, `Mty_Container_Release_Sheet_${new Date().toISOString().slice(0, 10)}.xlsx`);
+            // Capture original template styles for columns A..K (0..10) from existing data rows (Row 4+)
+            const templateColStyles = {};
+            const gridStyleByCode = {};
+            const maxScanRow = Math.max(currentRange.e.r, 10);
+
+            for (let r = 3; r <= maxScanRow; r++) {
+              const gridCell = ws[XLSX.utils.encode_cell({ r, c: 5 })];
+              const gridCode =
+                gridCell && gridCell.v !== undefined
+                  ? String(gridCell.v).trim().toUpperCase()
+                  : "";
+
+              for (let c = 0; c <= 10; c++) {
+                const cell = ws[XLSX.utils.encode_cell({ r, c })];
+                if (cell && cell.s) {
+                  if (!templateColStyles[c]) {
+                    templateColStyles[c] = cloneStyle(cell.s);
+                  }
+                  if (c === 5 && gridCode && !gridStyleByCode[gridCode]) {
+                    gridStyleByCode[gridCode] = cloneStyle(cell.s);
+                  }
+                }
+              }
+            }
+
+            // Capture template row height from Row 4 (index 3) if defined
+            const templateRowHeight =
+              ws["!rows"] && ws["!rows"][3] ? { ...ws["!rows"][3] } : undefined;
+
+            // Update notice banner in Row 1 if edited in app
+            if (notification && notification.trim() !== "") {
+              const bannerCellAddr = XLSX.utils.encode_cell({ r: 0, c: 9 });
+              if (ws[bannerCellAddr]) {
+                ws[bannerCellAddr].v = notification;
+              }
+            }
+
+            // Write updated data rows starting at Row 4 (index 3) while keeping rows 0..2 untouched
+            const totalDataCols = Math.max(currentRange.e.c, 10);
+
+            rowsList.forEach((rowObj, idx) => {
+              const targetR = 3 + idx;
+              const rowValues = [
+                idx + 1,
+                rowObj.customer || "",
+                rowObj.units || "",
+                rowObj.type || "",
+                rowObj.bookingNo || "",
+                (rowObj.exGrid || "").toUpperCase(),
+                (rowObj.ctnReleased || "").toUpperCase(),
+                (rowObj.truckId || "").toUpperCase(),
+                rowObj.time || "",
+                rowObj.doors || "Forward",
+                rowObj.comment || ""
+              ];
+
+              if (templateRowHeight) {
+                ws["!rows"] = ws["!rows"] || [];
+                if (!ws["!rows"][targetR]) {
+                  ws["!rows"][targetR] = { ...templateRowHeight };
+                }
+              }
+
+              for (let c = 0; c <= 10; c++) {
+                const addr = XLSX.utils.encode_cell({ r: targetR, c });
+                const existingCell = ws[addr];
+                const preservedStyle =
+                  (existingCell && existingCell.s ? cloneStyle(existingCell.s) : null) ||
+                  cloneStyle(templateColStyles[c]) ||
+                  {
+                    font: { name: "Calibri", sz: 11 },
+                    border: {
+                      top: { style: "thin", color: { rgb: "D9D9D9" } },
+                      bottom: { style: "thin", color: { rgb: "D9D9D9" } },
+                      left: { style: "thin", color: { rgb: "D9D9D9" } },
+                      right: { style: "thin", color: { rgb: "D9D9D9" } }
+                    }
+                  };
+
+                // Preserve or apply exact AV Grid color fill on Column F (Ex Grid, c === 5)
+                if (c === 5) {
+                  const gridUpper = (rowObj.exGrid || "").trim().toUpperCase();
+                  if (gridStyleByCode[gridUpper]) {
+                    ws[addr] = {
+                      v: rowValues[c],
+                      t: "s",
+                      s: cloneStyle(gridStyleByCode[gridUpper])
+                    };
+                    continue;
+                  } else if (EXCEL_GRID_FILL_FALLBACK[gridUpper]) {
+                    preservedStyle.fill = {
+                      patternType: "solid",
+                      fgColor: { rgb: EXCEL_GRID_FILL_FALLBACK[gridUpper] }
+                    };
+                    preservedStyle.font = {
+                      ...(preservedStyle.font || {}),
+                      bold: true
+                    };
+                    preservedStyle.alignment = {
+                      ...(preservedStyle.alignment || {}),
+                      horizontal: "center",
+                      vertical: "center"
+                    };
+                  }
+                }
+
+                const val = rowValues[c];
+                const isNumericCol = (c === 0 || c === 2) && val !== "" && !isNaN(Number(val));
+
+                ws[addr] = {
+                  v: isNumericCol ? Number(val) : val,
+                  t: isNumericCol ? "n" : "s",
+                  s: preservedStyle
+                };
+              }
+            });
+
+            // Clear any leftover rows from the original template beyond rowsList.length
+            const oldLastRow = currentRange.e.r;
+            const newLastRow = Math.max(2, 3 + rowsList.length - 1);
+            for (let r = newLastRow + 1; r <= oldLastRow; r++) {
+              for (let c = 0; c <= totalDataCols; c++) {
+                const addr = XLSX.utils.encode_cell({ r, c });
+                if (ws[addr]) {
+                  delete ws[addr];
+                }
+              }
+            }
+
+            // Update sheet bounds (!ref) cleanly
+            ws["!ref"] = XLSX.utils.encode_range({
+              s: { r: 0, c: 0 },
+              e: { r: newLastRow, c: totalDataCols }
+            });
+          });
+
+          const baseName = currentWorkbookName
+            ? currentWorkbookName.replace(/\.xlsx?$/i, "")
+            : "Mty_Container_Release_Sheet";
+          XLSX.writeFile(wb, `${baseName}_Updated_${new Date().toISOString().slice(0, 10)}.xlsx`, {
+            cellStyles: true
+          });
+        } catch (err) {
+          console.error("Styled export error:", err);
+          alert("There was an issue exporting the workbook. Please try re-importing the master Excel file.");
+        }
       };
 
       const openCommentModal = (index, text) => {
@@ -2068,6 +2282,47 @@
           </main>
 
           {/* ================================================================= */}
+          {/* ALERT MODAL: NO IMPORTED SHEET TEMPLATE YET                       */}
+          {/* ================================================================= */}
+          {isNoTemplateAlertOpen && (
+            <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
+              <div className="bg-gray-900 border border-amber-700/60 rounded-2xl p-6 w-full max-w-md shadow-2xl space-y-4">
+                <div className="flex items-start gap-3">
+                  <span className="px-2.5 py-1 rounded-lg bg-amber-950 text-amber-300 border border-amber-700/60 text-sm font-bold">
+                    !
+                  </span>
+                  <div>
+                    <h3 className="text-lg font-bold text-white">No Imported Sheet Found</h3>
+                    <p className="text-sm text-gray-300 mt-1.5 leading-relaxed">
+                      There is currently no imported master Excel sheet loaded. Because exports preserve the exact formatting and colors of your original spreadsheet, please import a master <code className="text-amber-300">.xlsx</code> sheet first before exporting.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="pt-2 flex items-center justify-end gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setIsNoTemplateAlertOpen(false)}
+                    className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium rounded-lg transition"
+                  >
+                    Close
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsNoTemplateAlertOpen(false);
+                      fileInputRef.current.click();
+                    }}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold rounded-lg transition"
+                  >
+                    Import Master (.xlsx)
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ================================================================= */}
           {/* IMPORT REVIEW & MERGE / OVERWRITE MODAL                           */}
           {/* ================================================================= */}
           {pendingImportReview && (
@@ -2090,7 +2345,6 @@
                   </button>
                 </div>
 
-                {/* Change Summary Counters */}
                 <div className="px-6 py-3.5 bg-gray-950/70 border-b border-gray-800 grid grid-cols-2 sm:grid-cols-4 gap-3">
                   <div className="bg-emerald-950/40 border border-emerald-800/50 rounded-lg px-3 py-2">
                     <div className="text-[11px] text-emerald-400 uppercase font-semibold">New Lines</div>
@@ -2118,7 +2372,6 @@
                   </div>
                 </div>
 
-                {/* Detailed List of Detected Changes */}
                 <div className="flex-1 overflow-auto p-6 space-y-2.5">
                   {pendingImportReview.summary.items.length === 0 ? (
                     <div className="text-center py-10 text-gray-400 text-sm">
@@ -2235,7 +2488,6 @@
                   )}
                 </div>
 
-                {/* Action Footer: Cancel, Overwrite Entire Sheet, or Merge Changes Only */}
                 <div className="px-6 py-4 bg-gray-950/80 border-t border-gray-800 flex flex-wrap items-center justify-between gap-3">
                   <button
                     type="button"
@@ -2318,7 +2570,6 @@
                   </button>
                 </div>
 
-                {/* Add New User Form */}
                 <form onSubmit={handleAddUser} className="p-6 bg-gray-950/60 border-b border-gray-800 space-y-3">
                   <div className="flex flex-wrap sm:flex-nowrap items-center gap-3">
                     <input
@@ -2357,7 +2608,6 @@
                   )}
                 </form>
 
-                {/* Active User List (PINs completely hidden) */}
                 <div className="flex-1 overflow-auto p-6 space-y-2.5">
                   {users.map((u) => {
                     const isDefaultPending = u.pin === DEFAULT_PIN || u.mustChangePin;
@@ -2509,7 +2759,6 @@
                         No log entries found matching your filter within the last 7 days.
                       </div>
                     ) : isGroupedViewActive ? (
-                      /* GROUPED VIEW BY BOOKING # / CUSTOMER */
                       <div className="space-y-5">
                         {groupedLogEntries.map((group) => (
                           <div
@@ -2553,7 +2802,6 @@
                         ))}
                       </div>
                     ) : (
-                      /* CHRONOLOGICAL FULL-LINE SNAPSHOT VIEW */
                       <div className="space-y-3">
                         {filteredLogs.map((log) => renderFullLineLogCard(log))}
                       </div>
@@ -2563,7 +2811,6 @@
                       No backup snapshots stored yet. Whenever an Excel sheet is imported, the previous sheet is automatically backed up here for 7 days.
                     </div>
                   ) : (
-                    /* IMPORT BACKUPS TAB WITH EXCEL FILENAME + DATE & TIME */
                     <div className="space-y-3">
                       {importSnapshots.map((snap) => (
                         <div
