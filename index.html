@@ -578,7 +578,7 @@
     };
 
     function App() {
-      const [activeDay, setActiveDay] = useState("Monday");
+      const [activeDay, setActiveDay] = useState(() => getCurrentDayName());
       const [syncStatus, setSyncStatus] = useState(
         isFirebaseConfigured ? "connecting" : "unconfigured"
       );
@@ -1101,6 +1101,7 @@
         };
         setCurrentUser(safeSession);
         sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(safeSession));
+        setActiveDay(getCurrentDayName());
         setLoginUsername("");
         setLoginPin("");
       };
@@ -1137,6 +1138,7 @@
         setUsers(updatedUsers);
         setCurrentUser(safeSession);
         sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(safeSession));
+        setActiveDay(getCurrentDayName());
         setPendingPinSetupUser(null);
         setNewPersonalPin("");
         setConfirmPersonalPin("");
@@ -1543,7 +1545,7 @@
               lastTouchedAt: now
             };
           } else {
-            // Start a brand-new log entry (new row, different user, idle > 3 mins, or re-editing an already-changed field)
+            // Start a brand-new log entry (new row, different user, idle > 90s, or re-editing an already-changed field)
             const combinedSummary = fieldDiffs
               .map((c) => `${c.label}: "${c.oldVal || "Empty"}" → "${c.newVal || "Cleared"}"`)
               .join(" • ");
@@ -1833,6 +1835,7 @@
         setImportSnapshots(updatedSnapshots);
         setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
         setPendingImportReview(null);
+        setActiveDay(getCurrentDayName());
         initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(finalDaysData));
 
         persistState({
@@ -2246,6 +2249,7 @@
       // SCREEN 3: MAIN CONTAINER RELEASE WORKSPACE
       // =======================================================================
       const currentDayRows = (sheetData[activeDay] || []).filter((r) => isRowValid(r) || r.isNew);
+      const todayDayName = getCurrentDayName();
 
       const matchesLogSearch = (log, q) => {
         if (!q) return true;
@@ -2588,6 +2592,7 @@
           <nav className="bg-gray-900/80 border-b border-gray-800 px-6 flex items-center gap-1 overflow-x-auto">
             {DAYS.map((day) => {
               const active = activeDay === day;
+              const isToday = day === todayDayName;
               const count = (sheetData[day] || []).filter(isRowValid).length;
               return (
                 <button
@@ -2599,7 +2604,12 @@
                       : "border-transparent text-gray-400 hover:text-gray-200 hover:bg-gray-800/30"
                   }`}
                 >
-                  {day}
+                  <span>{day}</span>
+                  {isToday && (
+                    <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-700/60">
+                      Today
+                    </span>
+                  )}
                   <span className={`text-xs px-2 py-0.5 rounded-full ${active ? "bg-emerald-950 text-emerald-300 border border-emerald-800" : "bg-gray-800 text-gray-400"}`}>
                     {count}
                   </span>
