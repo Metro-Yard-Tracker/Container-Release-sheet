@@ -82,7 +82,9 @@
 
     const DOOR_OPTIONS = ["Forward", "Rear", "Passengers", "Drivers"];
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v5";
+    const ROW_LOCK_DURATION_MS = 5000; // 5 seconds from first character until 5 seconds after last character
+    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v6";
+    const LOCAL_LOCKS_STORAGE_KEY = "container_release_active_locks_v1";
     const SESSION_STORAGE_KEY = "container_release_active_user_v1";
     const DEFAULT_PIN = "1111";
 
@@ -162,15 +164,23 @@
       Sunday: []
     });
 
+    const generateRowId = () =>
+      `row-${Date.now()}-${Math.random().toString(36).substr(2, 7)}`;
+
     const normalizeDaysData = (rawDays) => {
       const normalized = createEmptyDaysObject();
       if (!rawDays) return normalized;
       DAYS.forEach((day) => {
+        let list = [];
         if (Array.isArray(rawDays[day])) {
-          normalized[day] = rawDays[day];
+          list = rawDays[day];
         } else if (rawDays[day] && typeof rawDays[day] === "object") {
-          normalized[day] = Object.values(rawDays[day]);
+          list = Object.values(rawDays[day]);
         }
+        normalized[day] = list.map((row, idx) => ({
+          ...row,
+          rowId: row.rowId || `${day.toLowerCase()}-row-${idx}-${(row.bookingNo || "").replace(/[^a-zA-Z0-9]/g, "")}`
+        }));
       });
       return normalized;
     };
@@ -219,7 +229,13 @@
       return String(val).trim();
     };
 
-    // Smart matching and diff calculation between existing week data and newly imported Excel data
+    // Normalize values for accurate comparison (strips extra spaces and normalizes case)
+    const normStr = (v) => (v !== undefined && v !== null ? String(v).trim().replace(/\s+/g, " ") : "");
+    const normKey = (v) => normStr(v).toLowerCase();
+
+    // =========================================================================
+    // BOOKING-FIRST IMPORT COMPARISON ENGINE (NEVER SWALLOWS NEW BOOKING LINES)
+    // =========================================================================
     const computeImportAnalysis = (currentDays, incomingDays) => {
       const mergedDays = createEmptyDaysObject();
       const summary = {
@@ -234,11 +250,11 @@
         const existingRows = (currentDays[day] || []).filter(
           (r) =>
             r &&
-            ((r.customer && r.customer.trim()) ||
-              (r.bookingNo && r.bookingNo.trim()) ||
-              (r.type && r.type.trim()) ||
-              (r.exGrid && r.exGrid.trim()) ||
-              (r.ctnReleased && r.ctnReleased.trim()))
+            (normStr(r.customer) ||
+              normStr(r.bookingNo) ||
+              normStr(r.type) ||
+              normStr(r.exGrid) ||
+              normStr(r.ctnReleased))
         );
         const incomingRows = incomingDays[day] || [];
 
@@ -246,20 +262,20 @@
         const usedIncomingIndices = new Set();
         const updatedExistingMap = new Map();
 
-        // Pass 1: Exact composite match
+        // Pass 1: Exact composite match (Customer + Booking # + Type + ExGrid)
         incomingRows.forEach((inc, incIdx) => {
-          const incCust = (inc.customer || "").trim().toLowerCase();
-          const incBkg = (inc.bookingNo || "").trim().toLowerCase();
-          const incType = (inc.type || "").trim().toLowerCase();
-          const incGrid = (inc.exGrid || "").trim().toLowerCase();
+          const incCust = normKey(inc.customer);
+          const incBkg = normKey(inc.bookingNo);
+          const incType = normKey(inc.type);
+          const incGrid = normKey(inc.exGrid);
 
           const matchIdx = existingRows.findIndex((ex, exIdx) => {
             if (usedExistingIndices.has(exIdx)) return false;
             return (
-              (ex.customer || "").trim().toLowerCase() === incCust &&
-              (ex.bookingNo || "").trim().toLowerCase() === incBkg &&
-              (ex.type || "").trim().toLowerCase() === incType &&
-              (ex.exGrid || "").trim().toLowerCase() === incGrid
+              normKey(ex.customer) === incCust &&
+              normKey(ex.bookingNo) === incBkg &&
+              normKey(ex.type) === incType &&
+              normKey(ex.exGrid) === incGrid
             );
           });
 
@@ -270,8 +286,8 @@
             const ex = existingRows[matchIdx];
             const diffs = [];
             SCHEDULE_FIELDS.forEach((field) => {
-              const oldVal = (ex[field] || "").toString().trim();
-              const newVal = (inc[field] || "").toString().trim();
+              const oldVal = normStr(ex[field]);
+              const newVal = normStr(inc[field]);
               if (oldVal !== newVal) {
                 diffs.push({
                   field,
@@ -310,78 +326,16 @@
           }
         });
 
-        // Pass 2: Same row position fallback
+        // Pass 2: Match on same Booking # + Customer (handles updated Ex Grid, # Units, or Type on an existing booking)
         incomingRows.forEach((inc, incIdx) => {
           if (usedIncomingIndices.has(incIdx)) return;
-          if (incIdx < existingRows.length && !usedExistingIndices.has(incIdx)) {
-            const ex = existingRows[incIdx];
-            const sameCustomer =
-              (ex.customer || "").trim().toLowerCase() === (inc.customer || "").trim().toLowerCase();
-            const sameBooking =
-              (ex.bookingNo || "").trim().toLowerCase() === (inc.bookingNo || "").trim().toLowerCase() &&
-              (inc.bookingNo || "").trim() !== "";
-
-            if (sameCustomer || sameBooking) {
-              usedExistingIndices.add(incIdx);
-              usedIncomingIndices.add(incIdx);
-
-              const diffs = [];
-              SCHEDULE_FIELDS.forEach((field) => {
-                const oldVal = (ex[field] || "").toString().trim();
-                const newVal = (inc[field] || "").toString().trim();
-                if (oldVal !== newVal) {
-                  diffs.push({
-                    field,
-                    label: FIELD_LABELS[field] || field,
-                    oldVal: oldVal || "Empty",
-                    newVal: newVal || "Empty"
-                  });
-                }
-              });
-
-              const mergedRow = {
-                ...ex,
-                customer: inc.customer,
-                units: inc.units,
-                type: inc.type,
-                bookingNo: inc.bookingNo,
-                exGrid: inc.exGrid
-              };
-
-              if (diffs.length > 0) {
-                updatedExistingMap.set(incIdx, { updatedRow: mergedRow, diffs });
-                summary.updatedCount += 1;
-                summary.items.push({
-                  type: "updated",
-                  day,
-                  lineNo: incIdx + 1,
-                  customer: mergedRow.customer,
-                  bookingNo: mergedRow.bookingNo,
-                  exGrid: mergedRow.exGrid,
-                  ctnReleased: mergedRow.ctnReleased,
-                  truckId: mergedRow.truckId,
-                  diffs
-                });
-              } else {
-                summary.unchangedCount += 1;
-              }
-            }
-          }
-        });
-
-        // Pass 3: Secondary match on Customer + Booking #
-        incomingRows.forEach((inc, incIdx) => {
-          if (usedIncomingIndices.has(incIdx)) return;
-          const incCust = (inc.customer || "").trim().toLowerCase();
-          const incBkg = (inc.bookingNo || "").trim().toLowerCase();
-          if (!incCust && !incBkg) return;
+          const incCust = normKey(inc.customer);
+          const incBkg = normKey(inc.bookingNo);
+          if (!incBkg) return;
 
           const matchIdx = existingRows.findIndex((ex, exIdx) => {
             if (usedExistingIndices.has(exIdx)) return false;
-            return (
-              (ex.customer || "").trim().toLowerCase() === incCust &&
-              (ex.bookingNo || "").trim().toLowerCase() === incBkg
-            );
+            return normKey(ex.customer) === incCust && normKey(ex.bookingNo) === incBkg;
           });
 
           if (matchIdx !== -1) {
@@ -391,8 +345,8 @@
             const ex = existingRows[matchIdx];
             const diffs = [];
             SCHEDULE_FIELDS.forEach((field) => {
-              const oldVal = (ex[field] || "").toString().trim();
-              const newVal = (inc[field] || "").toString().trim();
+              const oldVal = normStr(ex[field]);
+              const newVal = normStr(inc[field]);
               if (oldVal !== newVal) {
                 diffs.push({
                   field,
@@ -432,6 +386,8 @@
           }
         });
 
+        // Build merged list for this day:
+        // All existing lines stay intact (with schedule updates applied where matched, preserving Ctn/Truck/Time/Doors/Comments)
         const dayMergedList = existingRows.map((ex, exIdx) => {
           if (!usedExistingIndices.has(exIdx)) {
             summary.removedCount += 1;
@@ -453,9 +409,14 @@
           return { ...ex };
         });
 
+        // Every unmatched incoming line is guaranteed to be treated as a + New Line
         incomingRows.forEach((inc, incIdx) => {
           if (!usedIncomingIndices.has(incIdx)) {
-            dayMergedList.push({ ...inc });
+            const newLineObj = {
+              ...inc,
+              rowId: inc.rowId || generateRowId()
+            };
+            dayMergedList.push(newLineObj);
             summary.addedCount += 1;
             summary.items.push({
               type: "added",
@@ -473,6 +434,10 @@
 
         mergedDays[day] = dayMergedList.map((r, idx) => ({ ...r, lineNo: idx + 1 }));
       });
+
+      // Sort preview items so "+ New Line" and "~ Updated" appear right at the top
+      const typeOrder = { added: 0, updated: 1, removed: 2 };
+      summary.items.sort((a, b) => (typeOrder[a.type] ?? 9) - (typeOrder[b.type] ?? 9));
 
       return { mergedDays, summary };
     };
@@ -504,6 +469,17 @@
         } catch (e) {}
         return null;
       });
+
+      // Live Row Locks State: { [lockKey]: { userId, username, expiresAt } }
+      const [activeRowLocks, setActiveRowLocks] = useState(() => {
+        try {
+          const raw = localStorage.getItem(LOCAL_LOCKS_STORAGE_KEY);
+          return raw ? JSON.parse(raw) : {};
+        } catch (e) {
+          return {};
+        }
+      });
+      const [nowTick, setNowTick] = useState(Date.now());
 
       // Login Screen Inputs
       const [loginUsername, setLoginUsername] = useState("");
@@ -599,10 +575,58 @@
       const initialLoadSnapshotRef = useRef({});
       const fileInputRef = useRef(null);
 
+      // 500ms ticker to update 5-second live row countdowns smoothly and auto-expire locks
+      useEffect(() => {
+        const timer = setInterval(() => {
+          setNowTick(Date.now());
+        }, 500);
+        return () => clearInterval(timer);
+      }, []);
+
+      // Listen for live row lock updates across browser tabs (when testing locally without Firebase)
+      useEffect(() => {
+        const handleStorageSync = (e) => {
+          if (e.key === LOCAL_LOCKS_STORAGE_KEY && e.newValue) {
+            try {
+              setActiveRowLocks(JSON.parse(e.newValue));
+            } catch (err) {}
+          }
+        };
+        window.addEventListener("storage", handleStorageSync);
+        return () => window.removeEventListener("storage", handleStorageSync);
+      }, []);
+
       const pruneOlderThanSevenDays = (items) => {
         if (!Array.isArray(items)) return [];
         const cutoff = Date.now() - SEVEN_DAYS_MS;
         return items.filter((item) => item && item.timestamp && item.timestamp >= cutoff);
+      };
+
+      // Trigger or reset the 5-second red highlight lock on a specific row whenever a character is typed
+      const touchRowActivityLock = (day, rowObj, rowIndex) => {
+        if (!currentUser || !rowObj) return;
+        const rowKey = rowObj.rowId || `idx-${rowIndex}`;
+        const compositeKey = `${day}__${rowKey}`;
+        const lockRecord = {
+          userId: currentUser.id,
+          username: currentUser.username,
+          expiresAt: Date.now() + ROW_LOCK_DURATION_MS
+        };
+
+        setActiveRowLocks((prev) => {
+          const updated = {
+            ...prev,
+            [compositeKey]: lockRecord
+          };
+          try {
+            localStorage.setItem(LOCAL_LOCKS_STORAGE_KEY, JSON.stringify(updated));
+          } catch (e) {}
+          return updated;
+        });
+
+        if (db) {
+          db.ref(`container_release_locks/${compositeKey}`).set(lockRecord).catch(() => {});
+        }
       };
 
       const persistState = (overrides = {}) => {
@@ -672,6 +696,13 @@
           }
         });
 
+        // Subscribe to real-time row locks across all connected users
+        const locksRef = db.ref("container_release_locks");
+        locksRef.on("value", (snap) => {
+          const val = snap.val() || {};
+          setActiveRowLocks(val);
+        });
+
         const releaseRef = db.ref("container_release");
         releaseRef.on(
           "value",
@@ -709,6 +740,7 @@
 
         return () => {
           connectedRef.off();
+          locksRef.off();
           releaseRef.off();
         };
       }, []);
@@ -1013,9 +1045,31 @@
         );
       };
 
+      // Check whether a row is currently active in its 5-second typing window
+      const getRowLockStatus = (day, rowObj, rowIndex) => {
+        if (!rowObj) return { isLocked: false, isLockedByOther: false, remainingSec: 0, username: "" };
+        const rowKey = rowObj.rowId || `idx-${rowIndex}`;
+        const compositeKey = `${day}__${rowKey}`;
+        const lock = activeRowLocks[compositeKey];
+        if (!lock || !lock.expiresAt || lock.expiresAt <= nowTick) {
+          return { isLocked: false, isLockedByOther: false, remainingSec: 0, username: "" };
+        }
+        const remainingSec = Math.max(1, Math.ceil((lock.expiresAt - nowTick) / 1000));
+        const isSelf = currentUser && lock.userId === currentUser.id;
+        return {
+          isLocked: true,
+          isLockedByOther: !isSelf,
+          remainingSec,
+          username: lock.username || "Another user"
+        };
+      };
+
       const handleCellChange = (rowIndex, field, value) => {
         const updatedDayData = [...(sheetData[activeDay] || [])];
         if (!updatedDayData[rowIndex]) return;
+
+        // Start or reset the 5-second red highlight & lock timer on every single character typed
+        touchRowActivityLock(activeDay, updatedDayData[rowIndex], rowIndex);
 
         let autoTime = updatedDayData[rowIndex].time;
 
@@ -1089,6 +1143,7 @@
       const handleAddRow = () => {
         const currentList = sheetData[activeDay] || [];
         const newRow = {
+          rowId: generateRowId(),
           lineNo: currentList.length + 1,
           customer: "",
           units: "1",
@@ -1201,7 +1256,6 @@
               const sheetName = worksheet.name;
               const matchedDay = DAYS.find((d) => sheetName.toLowerCase().includes(d.toLowerCase()));
               if (matchedDay) {
-                // Capture first 3 header rows for metadata
                 const headers = [];
                 for (let r = 1; r <= 3; r++) {
                   const rowObj = worksheet.getRow(r);
@@ -1215,11 +1269,11 @@
                   newHeaderMeta[matchedDay] = headers;
                 }
 
-                // Parse data rows from Row 4 downward
                 const parsedRows = [];
                 worksheet.eachRow({ includeEmpty: false }, (rowObj, rowNumber) => {
                   if (rowNumber <= 3) return;
                   const rowData = {
+                    rowId: generateRowId(),
                     lineNo: parsedRows.length + 1,
                     customer: getExcelCellText(rowObj.getCell(2)),
                     units: getExcelCellText(rowObj.getCell(3)) || "1",
@@ -1516,7 +1570,7 @@
               row.commit();
             });
 
-            // Clear values (while keeping table grid borders/styles or clearing excess rows cleanly) beyond rowsList.length
+            // Clear values beyond rowsList.length
             const oldLastRow = worksheet.rowCount;
             const newLastRow = 3 + rowsList.length;
             for (let r = newLastRow + 1; r <= oldLastRow; r++) {
@@ -1550,11 +1604,21 @@
       };
 
       const openCommentModal = (index, text) => {
+        const targetRow = (sheetData[activeDay] || [])[index];
+        const lockStatus = getRowLockStatus(activeDay, targetRow, index);
+        if (lockStatus.isLockedByOther) return;
+        if (targetRow) {
+          touchRowActivityLock(activeDay, targetRow, index);
+        }
         setCommentModal({ isOpen: true, rowIndex: index, text: text || "" });
       };
 
       const saveCommentModal = () => {
         if (commentModal.rowIndex !== null) {
+          const targetRow = (sheetData[activeDay] || [])[commentModal.rowIndex];
+          if (targetRow) {
+            touchRowActivityLock(activeDay, targetRow, commentModal.rowIndex);
+          }
           handleCellBlur(commentModal.rowIndex, "comment", commentModal.text);
         }
         setCommentModal({ isOpen: false, rowIndex: null, text: "" });
@@ -2053,8 +2117,14 @@
 
           {/* Table Workspace */}
           <main className="flex-1 p-6 flex flex-col overflow-hidden">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-semibold text-gray-200">{activeDay} Schedule</h2>
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+              <div className="flex items-center gap-3">
+                <h2 className="text-lg font-semibold text-gray-200">{activeDay} Schedule</h2>
+                <span className="text-xs text-gray-400 flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-rose-500 inline-block"></span>
+                  Lines highlighted red are actively being typed in (5s live lock)
+                </span>
+              </div>
               {isAdmin && (
                 <button
                   onClick={handleAddRow}
@@ -2097,20 +2167,38 @@
                       const gridKey = (row.exGrid || "").toString().trim().toUpperCase();
                       const gridColorStyle = GRID_COLOR_MAP[gridKey] || DEFAULT_GRID_STYLE;
 
+                      const lockStatus = getRowLockStatus(activeDay, row, idx);
+                      const rowRedHighlightClass = lockStatus.isLocked
+                        ? "bg-rose-950/75 ring-1 ring-inset ring-rose-500/80"
+                        : "hover:bg-gray-800/40";
+
                       return (
                         <tr
-                          key={idx}
-                          draggable={isAdmin}
+                          key={row.rowId || idx}
+                          draggable={isAdmin && !lockStatus.isLockedByOther}
                           onDragStart={(e) => handleDragStart(e, idx)}
                           onDragOver={(e) => handleDragOver(e, idx)}
                           onDrop={(e) => handleDrop(e, idx)}
-                          className={`transition hover:bg-gray-800/40 ${
+                          className={`transition-colors duration-200 ${rowRedHighlightClass} ${
                             isDragged ? "opacity-30 bg-gray-800" : ""
                           } ${isDragOver ? "border-t-2 border-emerald-500 bg-emerald-950/20" : ""}`}
                         >
-                          {/* Line Number */}
-                          <td className="py-2.5 px-3 text-center text-gray-500 font-mono text-xs select-none">
-                            {idx + 1}
+                          {/* Line Number + Live 5s Lock Badge */}
+                          <td className="py-2.5 px-3 text-center text-gray-400 font-mono text-xs select-none">
+                            <div>{idx + 1}</div>
+                            {lockStatus.isLocked && (
+                              <div
+                                className="mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold whitespace-nowrap shadow"
+                                title={
+                                  lockStatus.isLockedByOther
+                                    ? `Read-only while ${lockStatus.username} is entering data`
+                                    : "Active typing window (5s)"
+                                }
+                              >
+                                <span>{lockStatus.username}</span>
+                                <span>• {lockStatus.remainingSec}s</span>
+                              </div>
+                            )}
                           </td>
 
                           {/* Customer */}
@@ -2118,10 +2206,13 @@
                             {isAdmin ? (
                               <input
                                 type="text"
+                                readOnly={lockStatus.isLockedByOther}
                                 value={row.customer || ""}
                                 onChange={(e) => handleCellChange(idx, "customer", e.target.value)}
                                 onBlur={(e) => handleCellBlur(idx, "customer", e.target.value)}
-                                className="w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition"
+                                className={`w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition ${
+                                  lockStatus.isLockedByOther ? "cursor-not-allowed opacity-75" : ""
+                                }`}
                               />
                             ) : (
                               <span className="text-gray-200 font-medium px-1">{row.customer || "-"}</span>
@@ -2133,10 +2224,13 @@
                             {isAdmin ? (
                               <input
                                 type="text"
+                                readOnly={lockStatus.isLockedByOther}
                                 value={row.units || ""}
                                 onChange={(e) => handleCellChange(idx, "units", e.target.value)}
                                 onBlur={(e) => handleCellBlur(idx, "units", e.target.value)}
-                                className="w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition"
+                                className={`w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition ${
+                                  lockStatus.isLockedByOther ? "cursor-not-allowed opacity-75" : ""
+                                }`}
                               />
                             ) : (
                               <span className="text-gray-300 font-mono px-1">{row.units || "1"}</span>
@@ -2148,10 +2242,13 @@
                             {isAdmin ? (
                               <input
                                 type="text"
+                                readOnly={lockStatus.isLockedByOther}
                                 value={row.type || ""}
                                 onChange={(e) => handleCellChange(idx, "type", e.target.value)}
                                 onBlur={(e) => handleCellBlur(idx, "type", e.target.value)}
-                                className="w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition font-mono uppercase"
+                                className={`w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition font-mono uppercase ${
+                                  lockStatus.isLockedByOther ? "cursor-not-allowed opacity-75" : ""
+                                }`}
                               />
                             ) : (
                               <span className="text-gray-200 font-mono uppercase px-1">{row.type || "-"}</span>
@@ -2163,10 +2260,13 @@
                             {isAdmin ? (
                               <input
                                 type="text"
+                                readOnly={lockStatus.isLockedByOther}
                                 value={row.bookingNo || ""}
                                 onChange={(e) => handleCellChange(idx, "bookingNo", e.target.value)}
                                 onBlur={(e) => handleCellBlur(idx, "bookingNo", e.target.value)}
-                                className="w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition font-mono"
+                                className={`w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition font-mono ${
+                                  lockStatus.isLockedByOther ? "cursor-not-allowed opacity-75" : ""
+                                }`}
                               />
                             ) : (
                               <span className="text-gray-200 font-mono px-1">{row.bookingNo || "-"}</span>
@@ -2178,10 +2278,13 @@
                             {isAdmin ? (
                               <input
                                 type="text"
+                                readOnly={lockStatus.isLockedByOther}
                                 value={row.exGrid || ""}
                                 onChange={(e) => handleCellChange(idx, "exGrid", e.target.value.toUpperCase())}
                                 onBlur={(e) => handleCellBlur(idx, "exGrid", e.target.value.toUpperCase())}
-                                className={`w-full font-bold px-2 py-1 rounded border text-xs text-center focus:outline-none transition font-mono uppercase ${gridColorStyle}`}
+                                className={`w-full font-bold px-2 py-1 rounded border text-xs text-center focus:outline-none transition font-mono uppercase ${gridColorStyle} ${
+                                  lockStatus.isLockedByOther ? "cursor-not-allowed opacity-75" : ""
+                                }`}
                               />
                             ) : (
                               <div className={`font-bold px-2 py-1 rounded border text-xs text-center font-mono uppercase ${gridColorStyle}`}>
@@ -2191,51 +2294,79 @@
                           </td>
 
                           {/* GENERAL USER EDITABLE: Ctn Released */}
-                          <td className="py-2.5 px-3 bg-emerald-950/10">
+                          <td className={`py-2.5 px-3 ${lockStatus.isLocked ? "" : "bg-emerald-950/10"}`}>
                             <input
                               type="text"
+                              readOnly={lockStatus.isLockedByOther}
                               value={row.ctnReleased || ""}
-                              placeholder="Enter Ctn #"
+                              placeholder={lockStatus.isLockedByOther ? `Locked (${lockStatus.username})` : "Enter Ctn #"}
                               onChange={(e) => handleCellChange(idx, "ctnReleased", e.target.value)}
                               onBlur={(e) => handleCellBlur(idx, "ctnReleased", e.target.value)}
-                              className="w-full bg-gray-900/60 border border-emerald-900/50 focus:border-emerald-500 text-emerald-200 font-mono uppercase px-2 py-1 rounded transition"
+                              className={`w-full bg-gray-900/70 border px-2 py-1 rounded transition font-mono uppercase ${
+                                lockStatus.isLockedByOther
+                                  ? "border-rose-600/60 text-rose-200 cursor-not-allowed opacity-75"
+                                  : lockStatus.isLocked
+                                  ? "border-rose-500 text-white focus:border-rose-400 focus:outline-none"
+                                  : "border-emerald-900/50 focus:border-emerald-500 text-emerald-200"
+                              }`}
                             />
                           </td>
 
                           {/* GENERAL USER EDITABLE: Truck ID */}
-                          <td className="py-2.5 px-3 bg-emerald-950/10">
+                          <td className={`py-2.5 px-3 ${lockStatus.isLocked ? "" : "bg-emerald-950/10"}`}>
                             <input
                               type="text"
+                              readOnly={lockStatus.isLockedByOther}
                               value={row.truckId || ""}
-                              placeholder="Enter Truck ID"
+                              placeholder={lockStatus.isLockedByOther ? "Locked" : "Enter Truck ID"}
                               onChange={(e) => handleCellChange(idx, "truckId", e.target.value)}
                               onBlur={(e) => handleCellBlur(idx, "truckId", e.target.value)}
-                              className="w-full bg-gray-900/60 border border-emerald-900/50 focus:border-emerald-500 text-gray-100 font-mono uppercase px-2 py-1 rounded transition"
+                              className={`w-full bg-gray-900/70 border px-2 py-1 rounded transition font-mono uppercase ${
+                                lockStatus.isLockedByOther
+                                  ? "border-rose-600/60 text-rose-200 cursor-not-allowed opacity-75"
+                                  : lockStatus.isLocked
+                                  ? "border-rose-500 text-white focus:border-rose-400 focus:outline-none"
+                                  : "border-emerald-900/50 focus:border-emerald-500 text-gray-100"
+                              }`}
                             />
                           </td>
 
                           {/* GENERAL USER EDITABLE: Time */}
-                          <td className="py-2.5 px-3 bg-emerald-950/10">
+                          <td className={`py-2.5 px-3 ${lockStatus.isLocked ? "" : "bg-emerald-950/10"}`}>
                             <input
                               type="text"
+                              readOnly={lockStatus.isLockedByOther}
                               maxLength={4}
                               placeholder="HHMM"
                               value={row.time || ""}
                               onChange={(e) => handleCellChange(idx, "time", e.target.value)}
                               onBlur={(e) => handleCellBlur(idx, "time", e.target.value)}
-                              className="w-full bg-gray-900/60 border border-emerald-900/50 focus:border-emerald-500 text-amber-300 font-mono px-2 py-1 rounded transition"
+                              className={`w-full bg-gray-900/70 border px-2 py-1 rounded transition font-mono ${
+                                lockStatus.isLockedByOther
+                                  ? "border-rose-600/60 text-rose-200 cursor-not-allowed opacity-75"
+                                  : lockStatus.isLocked
+                                  ? "border-rose-500 text-amber-200 focus:border-rose-400 focus:outline-none"
+                                  : "border-emerald-900/50 focus:border-emerald-500 text-amber-300"
+                              }`}
                             />
                           </td>
 
                           {/* GENERAL USER EDITABLE: Doors Dropdown */}
-                          <td className="py-2.5 px-3 bg-emerald-950/10">
+                          <td className={`py-2.5 px-3 ${lockStatus.isLocked ? "" : "bg-emerald-950/10"}`}>
                             <select
+                              disabled={lockStatus.isLockedByOther}
                               value={row.doors || "Forward"}
                               onChange={(e) => {
                                 handleCellChange(idx, "doors", e.target.value);
                                 handleCellBlur(idx, "doors", e.target.value);
                               }}
-                              className="w-full bg-gray-950 border border-emerald-900/50 hover:border-emerald-700 text-gray-200 text-xs py-1 px-2 rounded focus:outline-none focus:border-emerald-500 transition"
+                              className={`w-full bg-gray-950 border text-gray-200 text-xs py-1 px-2 rounded focus:outline-none transition ${
+                                lockStatus.isLockedByOther
+                                  ? "border-rose-600/60 cursor-not-allowed opacity-75"
+                                  : lockStatus.isLocked
+                                  ? "border-rose-500"
+                                  : "border-emerald-900/50 hover:border-emerald-700 focus:border-emerald-500"
+                              }`}
                             >
                               {DOOR_OPTIONS.map((option) => (
                                 <option key={option} value={option}>
@@ -2246,18 +2377,31 @@
                           </td>
 
                           {/* GENERAL USER EDITABLE: Comments Modal Trigger */}
-                          <td className="py-2.5 px-3 bg-emerald-950/10">
+                          <td className={`py-2.5 px-3 ${lockStatus.isLocked ? "" : "bg-emerald-950/10"}`}>
                             <div className="flex items-center justify-between gap-2">
                               <span
-                                onClick={() => openCommentModal(idx, row.comment)}
-                                className="text-xs text-gray-300 truncate max-w-[200px] cursor-pointer hover:text-white block"
-                                title="Click to expand instructions"
+                                onClick={() => !lockStatus.isLockedByOther && openCommentModal(idx, row.comment)}
+                                className={`text-xs truncate max-w-[200px] block ${
+                                  lockStatus.isLockedByOther
+                                    ? "text-rose-200 cursor-not-allowed"
+                                    : "text-gray-300 cursor-pointer hover:text-white"
+                                }`}
+                                title={
+                                  lockStatus.isLockedByOther
+                                    ? `Read-only while ${lockStatus.username} is editing`
+                                    : "Click to expand instructions"
+                                }
                               >
                                 {row.comment || <span className="text-gray-500 italic">+ Add instructions</span>}
                               </span>
                               <button
+                                disabled={lockStatus.isLockedByOther}
                                 onClick={() => openCommentModal(idx, row.comment)}
-                                className="text-emerald-400 hover:text-emerald-300 p-1"
+                                className={`p-1 ${
+                                  lockStatus.isLockedByOther
+                                    ? "text-gray-600 cursor-not-allowed"
+                                    : "text-emerald-400 hover:text-emerald-300"
+                                }`}
                                 title="Expand Instructions"
                               >
                                 💬
@@ -2269,8 +2413,13 @@
                           {isAdmin && (
                             <td className="py-2.5 px-3 text-center">
                               <button
+                                disabled={lockStatus.isLockedByOther}
                                 onClick={() => handleRemoveRow(idx)}
-                                className="text-gray-500 hover:text-rose-400 transition"
+                                className={`transition ${
+                                  lockStatus.isLockedByOther
+                                    ? "text-gray-700 cursor-not-allowed"
+                                    : "text-gray-500 hover:text-rose-400"
+                                }`}
                                 title="Delete Line"
                               >
                                 ✕
@@ -2352,7 +2501,7 @@
 
                 <div className="px-6 py-3.5 bg-gray-950/70 border-b border-gray-800 grid grid-cols-2 sm:grid-cols-4 gap-3">
                   <div className="bg-emerald-950/40 border border-emerald-800/50 rounded-lg px-3 py-2">
-                    <div className="text-[11px] text-emerald-400 uppercase font-semibold">New Lines</div>
+                    <div className="text-[11px] text-emerald-400 uppercase font-semibold">New Lines Added</div>
                     <div className="text-xl font-bold text-white font-mono">
                       +{pendingImportReview.summary.addedCount}
                     </div>
@@ -2533,7 +2682,13 @@
                 <textarea
                   rows={6}
                   value={commentModal.text}
-                  onChange={(e) => setCommentModal({ ...commentModal, text: e.target.value })}
+                  onChange={(e) => {
+                    const targetRow = (sheetData[activeDay] || [])[commentModal.rowIndex];
+                    if (targetRow) {
+                      touchRowActivityLock(activeDay, targetRow, commentModal.rowIndex);
+                    }
+                    setCommentModal({ ...commentModal, text: e.target.value });
+                  }}
                   className="w-full bg-gray-950 border border-gray-800 rounded-lg p-3 text-gray-100 focus:outline-none focus:border-emerald-500 text-sm mb-4"
                   placeholder="Enter detailed special instructions..."
                   autoFocus
