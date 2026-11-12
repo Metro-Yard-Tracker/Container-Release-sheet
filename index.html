@@ -83,7 +83,8 @@
     const DOOR_OPTIONS = ["Forward", "Rear", "Passengers", "Drivers"];
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
     const ROW_LOCK_DURATION_MS = 5000; // 5 seconds from first character until 5 seconds after last character
-    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v8";
+    const ROW_EDIT_SESSION_IDLE_MS = 3 * 60 * 1000; // 3-minute idle fallback if user steps away and returns to same row
+    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v9";
     const LOCAL_LOCKS_STORAGE_KEY = "container_release_active_locks_v1";
     const SESSION_STORAGE_KEY = "container_release_active_user_v1";
     const DEFAULT_PIN = "1111";
@@ -207,12 +208,20 @@
       let hasChanges = false;
       logsByWeek.forEach((wkLogs, wkStart) => {
         const existing = archiveMap.get(wkStart);
-        const existingIds = new Set(existing ? existing.logs.map((l) => l.id) : []);
-        const newEntries = wkLogs.filter((l) => !existingIds.has(l.id));
+        const existingById = new Map(existing ? existing.logs.map((l) => [l.id, l]) : []);
 
-        if (!existing || newEntries.length > 0) {
+        let weekModified = !existing;
+        wkLogs.forEach((l) => {
+          const prev = existingById.get(l.id);
+          if (!prev || JSON.stringify(prev) !== JSON.stringify(l)) {
+            existingById.set(l.id, l);
+            weekModified = true;
+          }
+        });
+
+        if (weekModified) {
           hasChanges = true;
-          const mergedLogs = existing ? [...newEntries, ...existing.logs] : [...wkLogs];
+          const mergedLogs = Array.from(existingById.values());
           mergedLogs.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
           archiveMap.set(wkStart, {
             id: `week-arch-${wkStart}`,
@@ -410,7 +419,7 @@
           }
         };
 
-        // Pass 1: Exact composite match (Customer + Booking # + Type + ExGrid)
+        // Pass 1: Exact composite match
         incomingRows.forEach((inc, incIdx) => {
           if (usedIncomingIndices.has(incIdx)) return;
           const incCust = normKey(inc.customer);
@@ -672,10 +681,7 @@
         return "";
       });
 
-      // Alert modal when user tries to export before importing a master sheet
       const [isNoTemplateAlertOpen, setIsNoTemplateAlertOpen] = useState(false);
-
-      // Import Comparison & Merge Modal State
       const [pendingImportReview, setPendingImportReview] = useState(null);
 
       const [notification, setNotification] = useState("");
@@ -729,16 +735,27 @@
       const initialLoadSnapshotRef = useRef({});
       const fileInputRef = useRef(null);
 
+      // Tracks the user's active single-row editing pass so typing across Ctn # -> Truck ID -> Time -> Doors -> Comments
+      // merges into ONE combined log entry, while switching rows, another user editing, or returning later creates a NEW entry.
+      const activeRowEditSessionRef = useRef(null);
+
+      const resetRowEditSession = () => {
+        activeRowEditSessionRef.current = null;
+      };
+
       const isAdmin = currentUser && currentUser.role === "Admin";
 
-      // Ensure non-admin users can never view the admin-archives tab
+      // Reset row edit session when switching days or opening modals
+      useEffect(() => {
+        resetRowEditSession();
+      }, [activeDay, isLogModalOpen, isUserModalOpen]);
+
       useEffect(() => {
         if (!isAdmin && logModalTab === "admin-archives") {
           setLogModalTab("edits");
         }
       }, [isAdmin, logModalTab]);
 
-      // 500ms ticker to update 5-second live row countdowns smoothly
       useEffect(() => {
         const timer = setInterval(() => {
           setNowTick(Date.now());
@@ -746,7 +763,6 @@
         return () => clearInterval(timer);
       }, []);
 
-      // Listen for live row lock updates across browser tabs
       useEffect(() => {
         const handleStorageSync = (e) => {
           if (e.key === LOCAL_LOCKS_STORAGE_KEY && e.newValue) {
@@ -765,7 +781,6 @@
         return items.filter((item) => item && item.timestamp && item.timestamp >= cutoff);
       };
 
-      // Trigger or reset the 5-second red highlight lock on a specific row whenever a character is typed
       const touchRowActivityLock = (day, rowObj, rowIndex) => {
         if (!currentUser || !rowObj) return;
         const rowKey = rowObj.rowId || `idx-${rowIndex}`;
@@ -800,7 +815,6 @@
             ? overrides.weeklyLogArchives
             : weeklyLogArchives;
 
-        // Before pruning the 7-day rolling log, automatically archive any completed Monday-to-Sunday weeks
         const { archives: syncedArchives } = syncWeeklyLogArchives(
           rawLogs,
           baseArchives,
@@ -1126,6 +1140,7 @@
       };
 
       const handleLogout = () => {
+        resetRowEditSession();
         setCurrentUser(null);
         setPendingPinSetupUser(null);
         sessionStorage.removeItem(SESSION_STORAGE_KEY);
@@ -1254,6 +1269,19 @@
         return `${day} ${month} ${year} • ${hrs}:${mins}`;
       };
 
+      const buildRowSnapshotObject = (meta) => ({
+        customer: meta.customer || "",
+        units: meta.units || "1",
+        type: meta.type || "",
+        bookingNo: meta.bookingNo || "",
+        exGrid: meta.exGrid || "",
+        ctnReleased: meta.ctnReleased || "",
+        truckId: meta.truckId || "",
+        time: meta.time || "",
+        doors: meta.doors || "Forward",
+        comment: meta.comment || ""
+      });
+
       const createLogEntry = (day, lineNo, action, details, meta = {}, changeInfo = null) => {
         const now = Date.now();
         const hasRowSnapshot =
@@ -1263,20 +1291,17 @@
             meta.ctnReleased !== undefined ||
             meta.exGrid !== undefined);
 
-        const lineSnapshot = hasRowSnapshot
-          ? {
-              customer: meta.customer || "",
-              units: meta.units || "1",
-              type: meta.type || "",
-              bookingNo: meta.bookingNo || "",
-              exGrid: meta.exGrid || "",
-              ctnReleased: meta.ctnReleased || "",
-              truckId: meta.truckId || "",
-              time: meta.time || "",
-              doors: meta.doors || "Forward",
-              comment: meta.comment || ""
-            }
-          : null;
+        const lineSnapshot = hasRowSnapshot ? buildRowSnapshotObject(meta) : null;
+        const initialChanges = changeInfo
+          ? [
+              {
+                field: changeInfo.field,
+                label: FIELD_LABELS[changeInfo.field] || changeInfo.field,
+                oldVal: changeInfo.oldVal || "",
+                newVal: changeInfo.newVal || ""
+              }
+            ]
+          : [];
 
         return {
           id: `${now}-${Math.random().toString(36).substr(2, 5)}`,
@@ -1284,6 +1309,8 @@
           formattedTime: formatLogTimestamp(now),
           day,
           lineNo,
+          rowId: meta.rowId || null,
+          userId: currentUser ? currentUser.id : "unknown",
           username: currentUser ? currentUser.username : "Unknown",
           role: currentUser ? currentUser.role : "General User",
           action,
@@ -1293,6 +1320,7 @@
           ctnReleased: meta.ctnReleased || "",
           truckId: meta.truckId || "",
           lineSnapshot,
+          changes: initialChanges,
           changedField: changeInfo ? changeInfo.field : null,
           oldValue: changeInfo ? changeInfo.oldVal : null,
           newValue: changeInfo ? changeInfo.newVal : null
@@ -1344,10 +1372,27 @@
         };
       };
 
+      // When user focuses/clicks on a row, if it's a DIFFERENT row than their previous focus,
+      // close the previous row session so returning to that row later creates a fresh log entry.
+      const handleRowFocus = (day, rowObj, rowIndex) => {
+        if (!currentUser || !rowObj) return;
+        const rowKey = rowObj.rowId || `idx-${rowIndex}`;
+        const curSession = activeRowEditSessionRef.current;
+        if (
+          curSession &&
+          (curSession.userId !== currentUser.id ||
+            curSession.day !== day ||
+            curSession.rowKey !== rowKey)
+        ) {
+          activeRowEditSessionRef.current = null;
+        }
+      };
+
       const handleCellChange = (rowIndex, field, value) => {
         const updatedDayData = [...(sheetData[activeDay] || [])];
         if (!updatedDayData[rowIndex]) return;
 
+        handleRowFocus(activeDay, updatedDayData[rowIndex], rowIndex);
         touchRowActivityLock(activeDay, updatedDayData[rowIndex], rowIndex);
 
         let autoTime = updatedDayData[rowIndex].time;
@@ -1380,33 +1425,146 @@
 
         const targetRow = updatedDayData[rowIndex];
         const prevRowSnapshot = (initialLoadSnapshotRef.current[activeDay] || [])[rowIndex] || {};
-        const oldVal = (prevRowSnapshot[field] || "").toString().trim();
-        const newVal = (finalValue || "").toString().trim();
 
         updatedDayData[rowIndex] = {
           ...targetRow,
           [field]: finalValue
         };
 
+        const updatedRowObj = updatedDayData[rowIndex];
         const newSheetData = {
           ...sheetData,
           [activeDay]: updatedDayData
         };
         setSheetData(newSheetData);
 
+        // Collect all fields on this row that changed since the last saved snapshot
+        // (this automatically captures both the field blurred AND any auto-filled Time when Ctn # was entered)
+        const fieldDiffs = [];
+        const fieldsToCheck = Array.from(new Set([field, "time"]));
+        fieldsToCheck.forEach((fKey) => {
+          const oldVal = (prevRowSnapshot[fKey] || "").toString().trim();
+          const newVal = (updatedRowObj[fKey] || "").toString().trim();
+          if (oldVal !== newVal) {
+            fieldDiffs.push({
+              field: fKey,
+              label: FIELD_LABELS[fKey] || fKey,
+              oldVal,
+              newVal
+            });
+          }
+        });
+
         let updatedLogs = activityLogs;
-        if (oldVal !== newVal) {
-          const label = FIELD_LABELS[field] || field;
-          const summary = `${label}: "${oldVal || "Empty"}" → "${newVal || "Cleared"}"`;
-          const logItem = createLogEntry(
-            activeDay,
-            rowIndex + 1,
-            "Field Updated",
-            summary,
-            updatedDayData[rowIndex],
-            { field, oldVal, newVal }
-          );
-          updatedLogs = [logItem, ...activityLogs];
+        if (fieldDiffs.length > 0) {
+          const now = Date.now();
+          const rowKey = updatedRowObj.rowId || `idx-${rowIndex}`;
+          const session = activeRowEditSessionRef.current;
+
+          const isSameActiveSession =
+            session &&
+            currentUser &&
+            session.userId === currentUser.id &&
+            session.day === activeDay &&
+            session.rowKey === rowKey &&
+            now - session.lastTouchedAt <= ROW_EDIT_SESSION_IDLE_MS;
+
+          const existingEntryIdx = isSameActiveSession
+            ? activityLogs.findIndex((item) => item && item.id === session.logId)
+            : -1;
+
+          // Check if the user is re-editing a field they already edited in this session (e.g., going back to fix Truck ID)
+          const existingEntry = existingEntryIdx !== -1 ? activityLogs[existingEntryIdx] : null;
+          const alreadyEditedFields = existingEntry
+            ? new Set(
+                (Array.isArray(existingEntry.changes) && existingEntry.changes.length > 0
+                  ? existingEntry.changes.map((c) => c.field)
+                  : existingEntry.changedField
+                  ? [existingEntry.changedField]
+                  : [])
+              )
+            : new Set();
+
+          const isReEditingSameField = fieldDiffs.some((d) => alreadyEditedFields.has(d.field));
+
+          if (existingEntry && !isReEditingSameField) {
+            // Coalesce into the SAME single log entry for this user's continuous row pass
+            const priorChanges =
+              Array.isArray(existingEntry.changes) && existingEntry.changes.length > 0
+                ? existingEntry.changes
+                : existingEntry.changedField
+                ? [
+                    {
+                      field: existingEntry.changedField,
+                      label: FIELD_LABELS[existingEntry.changedField] || existingEntry.changedField,
+                      oldVal: existingEntry.oldValue || "",
+                      newVal: existingEntry.newValue || ""
+                    }
+                  ]
+                : [];
+
+            const mergedChanges = [...priorChanges, ...fieldDiffs];
+            const combinedSummary = mergedChanges
+              .map((c) => `${c.label}: "${c.oldVal || "Empty"}" → "${c.newVal || "Cleared"}"`)
+              .join(" • ");
+
+            const updatedEntry = {
+              ...existingEntry,
+              timestamp: now,
+              formattedTime: formatLogTimestamp(now),
+              lineNo: rowIndex + 1,
+              action: mergedChanges.length > 1 ? `Line Updated (${mergedChanges.length} fields)` : "Field Updated",
+              details: combinedSummary,
+              customer: updatedRowObj.customer || "",
+              bookingNo: updatedRowObj.bookingNo || "",
+              ctnReleased: updatedRowObj.ctnReleased || "",
+              truckId: updatedRowObj.truckId || "",
+              lineSnapshot: buildRowSnapshotObject(updatedRowObj),
+              changes: mergedChanges,
+              changedField: mergedChanges[mergedChanges.length - 1].field,
+              oldValue: mergedChanges[mergedChanges.length - 1].oldVal,
+              newValue: mergedChanges[mergedChanges.length - 1].newVal
+            };
+
+            const nextLogs = [...activityLogs];
+            nextLogs.splice(existingEntryIdx, 1);
+            updatedLogs = [updatedEntry, ...nextLogs];
+
+            activeRowEditSessionRef.current = {
+              userId: currentUser.id,
+              day: activeDay,
+              rowKey,
+              logId: updatedEntry.id,
+              lastTouchedAt: now
+            };
+          } else {
+            // Start a brand-new log entry (new row, different user, idle > 3 mins, or re-editing an already-changed field)
+            const combinedSummary = fieldDiffs
+              .map((c) => `${c.label}: "${c.oldVal || "Empty"}" → "${c.newVal || "Cleared"}"`)
+              .join(" • ");
+
+            const primaryDiff = fieldDiffs[0];
+            const logItem = createLogEntry(
+              activeDay,
+              rowIndex + 1,
+              fieldDiffs.length > 1 ? `Line Updated (${fieldDiffs.length} fields)` : "Field Updated",
+              combinedSummary,
+              updatedRowObj,
+              primaryDiff
+            );
+            logItem.changes = fieldDiffs;
+
+            updatedLogs = [logItem, ...activityLogs];
+
+            activeRowEditSessionRef.current = {
+              userId: currentUser ? currentUser.id : "unknown",
+              day: activeDay,
+              rowKey,
+              logId: logItem.id,
+              lastTouchedAt: now
+            };
+          }
+
           setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
           initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
         }
@@ -1418,6 +1576,7 @@
       };
 
       const handleAddRow = () => {
+        resetRowEditSession();
         const currentList = sheetData[activeDay] || [];
         const newRow = {
           rowId: generateRowId(),
@@ -1446,6 +1605,7 @@
       };
 
       const handleRemoveRow = (index) => {
+        resetRowEditSession();
         const currentList = sheetData[activeDay] || [];
         const removedRow = currentList[index] || {};
         const updatedList = currentList.filter((_, idx) => idx !== index).map((row, idx) => ({
@@ -1465,6 +1625,7 @@
 
       const handleDragStart = (e, index) => {
         if (!isAdmin) return;
+        resetRowEditSession();
         setDraggedRowIndex(index);
         e.dataTransfer.effectAllowed = "move";
       };
@@ -1514,6 +1675,7 @@
       const handleImportExcel = (e) => {
         const file = e.target.files[0];
         if (!file) return;
+        resetRowEditSession();
         const importedFileName = file.name;
 
         const reader = new FileReader();
@@ -1608,6 +1770,7 @@
 
       const applyImportAction = (mode, reviewPayload) => {
         if (!reviewPayload) return;
+        resetRowEditSession();
         const {
           importedFileName,
           incomingBase64,
@@ -1679,6 +1842,7 @@
 
       const handleRestoreSnapshot = (snapshot) => {
         if (!snapshot || !snapshot.daysData) return;
+        resetRowEditSession();
 
         const now = Date.now();
         const currentTotal = DAYS.reduce((acc, d) => acc + (sheetData[d] || []).filter(isRowValid).length, 0);
@@ -1881,6 +2045,7 @@
         const lockStatus = getRowLockStatus(activeDay, targetRow, index);
         if (lockStatus.isLockedByOther) return;
         if (targetRow) {
+          handleRowFocus(activeDay, targetRow, index);
           touchRowActivityLock(activeDay, targetRow, index);
         }
         setCommentModal({ isOpen: true, rowIndex: index, text: text || "" });
@@ -2152,7 +2317,6 @@
 
       const groupedLogEntries = buildGroupedLogs(filteredLogs);
 
-      // Filtered Admin Weekly Archives (Admin Only)
       const filteredWeeklyArchives = isAdmin
         ? weeklyLogArchives
             .filter((arch) =>
@@ -2175,6 +2339,20 @@
         const snap = log.lineSnapshot;
         const gridKey = snap && snap.exGrid ? snap.exGrid.trim().toUpperCase() : "";
         const gridColorStyle = GRID_COLOR_MAP[gridKey] || DEFAULT_GRID_STYLE;
+
+        // Build lookup map of all edited fields in this combined entry
+        const editedMap = new Map();
+        if (Array.isArray(log.changes) && log.changes.length > 0) {
+          log.changes.forEach((c) => {
+            if (c && c.field) editedMap.set(c.field, c);
+          });
+        } else if (log.changedField) {
+          editedMap.set(log.changedField, {
+            field: log.changedField,
+            oldVal: log.oldValue,
+            newVal: log.newValue
+          });
+        }
 
         return (
           <div
@@ -2202,7 +2380,8 @@
             {snap && (
               <div className="grid grid-cols-2 sm:grid-cols-5 lg:grid-cols-10 gap-1.5 pt-2 border-t border-gray-800/70">
                 {SNAPSHOT_COLUMNS.map((col) => {
-                  const isEditedField = log.changedField === col.key;
+                  const changeRecord = editedMap.get(col.key);
+                  const isEditedField = Boolean(changeRecord);
                   const cellVal = snap[col.key];
 
                   return (
@@ -2241,8 +2420,8 @@
                       )}
 
                       {isEditedField && (
-                        <div className="text-[10px] text-amber-400/90 truncate mt-0.5" title={`Previous: ${log.oldValue || "Empty"}`}>
-                          Was: {log.oldValue || "Empty"}
+                        <div className="text-[10px] text-amber-400/90 truncate mt-0.5" title={`Previous: ${changeRecord.oldVal || "Empty"}`}>
+                          Was: {changeRecord.oldVal || "Empty"}
                         </div>
                       )}
                     </div>
@@ -2517,6 +2696,7 @@
                                 type="text"
                                 readOnly={lockStatus.isLockedByOther}
                                 value={row.customer || ""}
+                                onFocus={() => handleRowFocus(activeDay, row, idx)}
                                 onChange={(e) => handleCellChange(idx, "customer", e.target.value)}
                                 onBlur={(e) => handleCellBlur(idx, "customer", e.target.value)}
                                 className={`w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition ${
@@ -2535,6 +2715,7 @@
                                 type="text"
                                 readOnly={lockStatus.isLockedByOther}
                                 value={row.units || ""}
+                                onFocus={() => handleRowFocus(activeDay, row, idx)}
                                 onChange={(e) => handleCellChange(idx, "units", e.target.value)}
                                 onBlur={(e) => handleCellBlur(idx, "units", e.target.value)}
                                 className={`w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition ${
@@ -2553,6 +2734,7 @@
                                 type="text"
                                 readOnly={lockStatus.isLockedByOther}
                                 value={row.type || ""}
+                                onFocus={() => handleRowFocus(activeDay, row, idx)}
                                 onChange={(e) => handleCellChange(idx, "type", e.target.value)}
                                 onBlur={(e) => handleCellBlur(idx, "type", e.target.value)}
                                 className={`w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition font-mono uppercase ${
@@ -2571,6 +2753,7 @@
                                 type="text"
                                 readOnly={lockStatus.isLockedByOther}
                                 value={row.bookingNo || ""}
+                                onFocus={() => handleRowFocus(activeDay, row, idx)}
                                 onChange={(e) => handleCellChange(idx, "bookingNo", e.target.value)}
                                 onBlur={(e) => handleCellBlur(idx, "bookingNo", e.target.value)}
                                 className={`w-full bg-transparent border-b border-transparent hover:border-gray-700 focus:border-emerald-500 text-gray-100 focus:outline-none px-1 py-0.5 rounded transition font-mono ${
@@ -2589,6 +2772,7 @@
                                 type="text"
                                 readOnly={lockStatus.isLockedByOther}
                                 value={row.exGrid || ""}
+                                onFocus={() => handleRowFocus(activeDay, row, idx)}
                                 onChange={(e) => handleCellChange(idx, "exGrid", e.target.value.toUpperCase())}
                                 onBlur={(e) => handleCellBlur(idx, "exGrid", e.target.value.toUpperCase())}
                                 className={`w-full font-bold px-2 py-1 rounded border text-xs text-center focus:outline-none transition font-mono uppercase ${gridColorStyle} ${
@@ -2609,6 +2793,7 @@
                               readOnly={lockStatus.isLockedByOther}
                               value={row.ctnReleased || ""}
                               placeholder={lockStatus.isLockedByOther ? `Locked (${lockStatus.username})` : "Enter Ctn #"}
+                              onFocus={() => handleRowFocus(activeDay, row, idx)}
                               onChange={(e) => handleCellChange(idx, "ctnReleased", e.target.value)}
                               onBlur={(e) => handleCellBlur(idx, "ctnReleased", e.target.value)}
                               className={`w-full bg-gray-900/70 border px-2 py-1 rounded transition font-mono uppercase ${
@@ -2628,6 +2813,7 @@
                               readOnly={lockStatus.isLockedByOther}
                               value={row.truckId || ""}
                               placeholder={lockStatus.isLockedByOther ? "Locked" : "Enter Truck ID"}
+                              onFocus={() => handleRowFocus(activeDay, row, idx)}
                               onChange={(e) => handleCellChange(idx, "truckId", e.target.value)}
                               onBlur={(e) => handleCellBlur(idx, "truckId", e.target.value)}
                               className={`w-full bg-gray-900/70 border px-2 py-1 rounded transition font-mono uppercase ${
@@ -2648,6 +2834,7 @@
                               maxLength={4}
                               placeholder="HHMM"
                               value={row.time || ""}
+                              onFocus={() => handleRowFocus(activeDay, row, idx)}
                               onChange={(e) => handleCellChange(idx, "time", e.target.value)}
                               onBlur={(e) => handleCellBlur(idx, "time", e.target.value)}
                               className={`w-full bg-gray-900/70 border px-2 py-1 rounded transition font-mono ${
@@ -2665,6 +2852,7 @@
                             <select
                               disabled={lockStatus.isLockedByOther}
                               value={row.doors || "Forward"}
+                              onFocus={() => handleRowFocus(activeDay, row, idx)}
                               onChange={(e) => {
                                 handleCellChange(idx, "doors", e.target.value);
                                 handleCellBlur(idx, "doors", e.target.value);
@@ -3157,7 +3345,7 @@
                     <p className="text-xs text-gray-400">
                       {logModalTab === "admin-archives" && isAdmin
                         ? "Restricted to Admin users. Logs are automatically backed up in Monday-to-Sunday weekly bundles so past weeks remain searchable."
-                        : "Every edit captures the full line snapshot. Searching by Booking #, Customer, or User automatically groups edits together."}
+                        : "Fields entered by the same user across one line combine into a single entry; edits by other users or return edits appear separately."}
                     </p>
                   </div>
                   <button
