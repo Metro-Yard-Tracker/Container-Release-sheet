@@ -83,7 +83,7 @@
     const DOOR_OPTIONS = ["Forward", "Rear", "Passengers", "Drivers"];
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
     const ROW_LOCK_DURATION_MS = 5000; // 5 seconds from first character until 5 seconds after last character
-    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v7";
+    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v8";
     const LOCAL_LOCKS_STORAGE_KEY = "container_release_active_locks_v1";
     const SESSION_STORAGE_KEY = "container_release_active_user_v1";
     const DEFAULT_PIN = "1111";
@@ -156,6 +156,83 @@
       { key: "comment", label: "Comments" }
     ];
 
+    // =========================================================================
+    // MONDAY-ANCHORED WEEKLY LOG ARCHIVE HELPERS (ADMIN-ONLY LONG-TERM BACKUP)
+    // =========================================================================
+    const getMondayWeekStartMs = (timestampMs) => {
+      const d = new Date(timestampMs);
+      d.setHours(0, 0, 0, 0);
+      const dayOfWeek = d.getDay(); // 0 = Sun, 1 = Mon, ..., 6 = Sat
+      const diffToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+      d.setDate(d.getDate() + diffToMonday);
+      return d.getTime();
+    };
+
+    const formatWeekRangeLabel = (mondayStartMs) => {
+      const start = new Date(mondayStartMs);
+      const end = new Date(mondayStartMs + 6 * 24 * 60 * 60 * 1000);
+      const fmt = (dt) => {
+        const day = String(dt.getDate()).padStart(2, "0");
+        const month = dt.toLocaleString("en-NZ", { month: "short" });
+        const year = dt.getFullYear();
+        return `${day} ${month} ${year}`;
+      };
+      return `Mon ${fmt(start)} – Sun ${fmt(end)}`;
+    };
+
+    // Automatically bundles logs into Monday-to-Sunday weekly archives before rolling 7-day pruning
+    const syncWeeklyLogArchives = (logsList, existingArchives = [], includeCurrentWeek = false, triggerReason = "Auto Weekly Backup (Monday Cycle)") => {
+      const safeLogs = Array.isArray(logsList) ? logsList : [];
+      const currentWeekStart = getMondayWeekStartMs(Date.now());
+      const archiveMap = new Map();
+
+      (Array.isArray(existingArchives) ? existingArchives : []).forEach((arch) => {
+        if (arch && arch.weekStartMs) {
+          archiveMap.set(arch.weekStartMs, {
+            ...arch,
+            logs: Array.isArray(arch.logs) ? [...arch.logs] : []
+          });
+        }
+      });
+
+      const logsByWeek = new Map();
+      safeLogs.forEach((log) => {
+        if (!log || !log.timestamp) return;
+        const wkStart = getMondayWeekStartMs(log.timestamp);
+        if (!includeCurrentWeek && wkStart >= currentWeekStart) return;
+        if (!logsByWeek.has(wkStart)) logsByWeek.set(wkStart, []);
+        logsByWeek.get(wkStart).push(log);
+      });
+
+      let hasChanges = false;
+      logsByWeek.forEach((wkLogs, wkStart) => {
+        const existing = archiveMap.get(wkStart);
+        const existingIds = new Set(existing ? existing.logs.map((l) => l.id) : []);
+        const newEntries = wkLogs.filter((l) => !existingIds.has(l.id));
+
+        if (!existing || newEntries.length > 0) {
+          hasChanges = true;
+          const mergedLogs = existing ? [...newEntries, ...existing.logs] : [...wkLogs];
+          mergedLogs.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+          archiveMap.set(wkStart, {
+            id: `week-arch-${wkStart}`,
+            weekStartMs: wkStart,
+            weekLabel: formatWeekRangeLabel(wkStart),
+            archivedAt: Date.now(),
+            backupNote: triggerReason,
+            entryCount: mergedLogs.length,
+            logs: mergedLogs
+          });
+        }
+      });
+
+      const sortedArchives = Array.from(archiveMap.values()).sort(
+        (a, b) => b.weekStartMs - a.weekStartMs
+      );
+
+      return { archives: sortedArchives, hasChanges };
+    };
+
     const createEmptyDaysObject = () => ({
       Monday: [],
       Tuesday: [],
@@ -217,7 +294,6 @@
       }
     };
 
-    // Extract plain text safely from an ExcelJS cell (handles formulas, richText, numbers, strings)
     const getExcelCellText = (cell) => {
       if (!cell || cell.value === null || cell.value === undefined) return "";
       const val = cell.value;
@@ -231,7 +307,6 @@
       return String(val).trim();
     };
 
-    // Normalize values for accurate comparison (strips extra spaces and normalizes case)
     const normStr = (v) => (v !== undefined && v !== null ? String(v).trim().replace(/\s+/g, " ") : "");
     const normKey = (v) => normStr(v).toLowerCase();
 
@@ -255,8 +330,6 @@
           const newVal = normStr(inc[field]);
 
           if (YARD_FIELDS.includes(field)) {
-            // Only flag a yard field diff if the incoming spreadsheet actually has a value in that column
-            // AND it differs from what is currently in the app
             if (newVal !== "" && normKey(oldVal) !== normKey(newVal)) {
               diffs.push({
                 field,
@@ -277,8 +350,6 @@
           }
         });
 
-        // For Merge mode: apply schedule updates and any non-empty incoming yard fields,
-        // while keeping existing live yard entries if the incoming sheet cell is blank
         const mergedRow = {
           ...ex,
           customer: normStr(inc.customer) !== "" ? inc.customer : ex.customer,
@@ -360,7 +431,7 @@
           if (matchIdx !== -1) registerMatch(matchIdx, incIdx);
         });
 
-        // Pass 2: Match on same Booking # + Customer (catches changed Ex Grid, # Units, Type, Truck ID, Time, Ctn #, Doors, Comment)
+        // Pass 2: Match on same Booking # + Customer
         incomingRows.forEach((inc, incIdx) => {
           if (usedIncomingIndices.has(incIdx)) return;
           const incCust = normKey(inc.customer);
@@ -375,7 +446,7 @@
           if (matchIdx !== -1) registerMatch(matchIdx, incIdx);
         });
 
-        // Pass 3: Match on Customer + Type + ExGrid + (Ctn # or Truck ID) when the Booking # itself was edited
+        // Pass 3: Match on Customer + Type + ExGrid + (Ctn # or Truck ID)
         incomingRows.forEach((inc, incIdx) => {
           if (usedIncomingIndices.has(incIdx)) return;
           const incCust = normKey(inc.customer);
@@ -402,8 +473,7 @@
           if (matchIdx !== -1) registerMatch(matchIdx, incIdx);
         });
 
-        // Pass 4: 1-to-1 same-position match ONLY if both rows have identical Customer + Type + ExGrid
-        // AND the counts of unmatched rows for that exact Customer+Type+Grid are equal (prevents swallowing a newly added line)
+        // Pass 4: 1-to-1 same-position match when unmatched counts for Customer+Type+ExGrid match
         incomingRows.forEach((inc, incIdx) => {
           if (usedIncomingIndices.has(incIdx)) return;
           if (incIdx >= existingRows.length || usedExistingIndices.has(incIdx)) return;
@@ -438,7 +508,6 @@
           }
         });
 
-        // Build merged list for this day
         const dayMergedList = existingRows.map((ex, exIdx) => {
           if (!usedExistingIndices.has(exIdx)) {
             summary.removedCount += 1;
@@ -460,7 +529,6 @@
           return { ...ex };
         });
 
-        // Every remaining unmatched incoming line is guaranteed to be treated as a + New Line
         incomingRows.forEach((inc, incIdx) => {
           if (!usedIncomingIndices.has(incIdx)) {
             const newLineObj = {
@@ -489,7 +557,6 @@
         mergedDays[day] = dayMergedList.map((r, idx) => ({ ...r, lineNo: idx + 1 }));
       });
 
-      // Sort preview items so "+ New Line" and "~ Updated" appear right at the top
       const typeOrder = { added: 0, updated: 1, removed: 2 };
       summary.items.sort((a, b) => (typeOrder[a.type] ?? 9) - (typeOrder[b.type] ?? 9));
 
@@ -524,7 +591,7 @@
         return null;
       });
 
-      // Live Row Locks State: { [lockKey]: { userId, username, expiresAt } }
+      // Live Row Locks State
       const [activeRowLocks, setActiveRowLocks] = useState(() => {
         try {
           const raw = localStorage.getItem(LOCAL_LOCKS_STORAGE_KEY);
@@ -618,18 +685,60 @@
       const [dragOverRowIndex, setDragOverRowIndex] = useState(null);
       const [commentModal, setCommentModal] = useState({ isOpen: false, rowIndex: null, text: "" });
       
-      // 7-Day Rolling Log & Snapshot State
-      const [activityLogs, setActivityLogs] = useState([]);
-      const [importSnapshots, setImportSnapshots] = useState([]);
+      // 7-Day Rolling Log, Sheet Snapshots & Admin-Only Monday-Anchored Weekly Log Archives
+      const [activityLogs, setActivityLogs] = useState(() => {
+        try {
+          const cached = localStorage.getItem(LOCAL_STORAGE_KEY);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (Array.isArray(parsed.activityLogs)) return parsed.activityLogs;
+          }
+        } catch (e) {}
+        return [];
+      });
+
+      const [importSnapshots, setImportSnapshots] = useState(() => {
+        try {
+          const cached = localStorage.getItem(LOCAL_STORAGE_KEY);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (Array.isArray(parsed.importSnapshots)) return parsed.importSnapshots;
+          }
+        } catch (e) {}
+        return [];
+      });
+
+      const [weeklyLogArchives, setWeeklyLogArchives] = useState(() => {
+        try {
+          const cached = localStorage.getItem(LOCAL_STORAGE_KEY);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (Array.isArray(parsed.weeklyLogArchives)) return parsed.weeklyLogArchives;
+          }
+        } catch (e) {}
+        return [];
+      });
+
       const [isLogModalOpen, setIsLogModalOpen] = useState(false);
       const [logModalTab, setLogModalTab] = useState("edits");
       const [logSearchQuery, setLogSearchQuery] = useState("");
       const [forceGroupMode, setForceGroupMode] = useState(false);
+      const [selectedArchiveWeekFilter, setSelectedArchiveWeekFilter] = useState("all");
+      const [archiveFlashMessage, setArchiveFlashMessage] = useState("");
       
       const initialLoadSnapshotRef = useRef({});
       const fileInputRef = useRef(null);
 
-      // 500ms ticker to update 5-second live row countdowns smoothly and auto-expire locks
+      const isAdmin = currentUser && currentUser.role === "Admin";
+
+      // Ensure non-admin users can never view the admin-archives tab
+      useEffect(() => {
+        if (!isAdmin && logModalTab === "admin-archives") {
+          setLogModalTab("edits");
+        }
+      }, [isAdmin, logModalTab]);
+
+      // 500ms ticker to update 5-second live row countdowns smoothly
       useEffect(() => {
         const timer = setInterval(() => {
           setNowTick(Date.now());
@@ -637,7 +746,7 @@
         return () => clearInterval(timer);
       }, []);
 
-      // Listen for live row lock updates across browser tabs (when testing locally without Firebase)
+      // Listen for live row lock updates across browser tabs
       useEffect(() => {
         const handleStorageSync = (e) => {
           if (e.key === LOCAL_LOCKS_STORAGE_KEY && e.newValue) {
@@ -684,9 +793,22 @@
       };
 
       const persistState = (overrides = {}) => {
-        const prunedLogs = pruneOlderThanSevenDays(
-          overrides.activityLogs !== undefined ? overrides.activityLogs : activityLogs
+        const rawLogs =
+          overrides.activityLogs !== undefined ? overrides.activityLogs : activityLogs;
+        const baseArchives =
+          overrides.weeklyLogArchives !== undefined
+            ? overrides.weeklyLogArchives
+            : weeklyLogArchives;
+
+        // Before pruning the 7-day rolling log, automatically archive any completed Monday-to-Sunday weeks
+        const { archives: syncedArchives } = syncWeeklyLogArchives(
+          rawLogs,
+          baseArchives,
+          false,
+          "Auto Weekly Backup (Monday Cycle)"
         );
+
+        const prunedLogs = pruneOlderThanSevenDays(rawLogs);
         const prunedSnapshots = pruneOlderThanSevenDays(
           overrides.importSnapshots !== undefined ? overrides.importSnapshots : importSnapshots
         );
@@ -709,6 +831,8 @@
             ? overrides.workbookTemplateBase64
             : workbookTemplateBase64;
 
+        setWeeklyLogArchives(syncedArchives);
+
         const payload = {
           daysData: nextDaysData,
           headerMetadata: nextHeaders,
@@ -718,6 +842,7 @@
           workbookTemplateBase64: nextTemplateBase64,
           activityLogs: prunedLogs,
           importSnapshots: prunedSnapshots,
+          weeklyLogArchives: syncedArchives,
           lastUpdated: new Date().toISOString()
         };
 
@@ -750,7 +875,6 @@
           }
         });
 
-        // Subscribe to real-time row locks across all connected users
         const locksRef = db.ref("container_release_locks");
         locksRef.on("value", (snap) => {
           const val = snap.val() || {};
@@ -776,11 +900,29 @@
               if (Array.isArray(val.users) && val.users.length > 0) {
                 setUsers(val.users);
               }
-              if (val.activityLogs) setActivityLogs(pruneOlderThanSevenDays(val.activityLogs));
+
+              const incomingLogs = Array.isArray(val.activityLogs) ? val.activityLogs : [];
+              const incomingArchives = Array.isArray(val.weeklyLogArchives) ? val.weeklyLogArchives : [];
+              const { archives: syncedArchives, hasChanges } = syncWeeklyLogArchives(
+                incomingLogs,
+                incomingArchives,
+                false,
+                "Auto Weekly Backup (Monday Cycle)"
+              );
+
+              setActivityLogs(pruneOlderThanSevenDays(incomingLogs));
+              setWeeklyLogArchives(syncedArchives);
               if (val.importSnapshots) setImportSnapshots(pruneOlderThanSevenDays(val.importSnapshots));
 
+              if (hasChanges) {
+                db.ref("container_release/weeklyLogArchives").set(syncedArchives).catch(() => {});
+              }
+
               try {
-                localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(val));
+                localStorage.setItem(
+                  LOCAL_STORAGE_KEY,
+                  JSON.stringify({ ...val, weeklyLogArchives: syncedArchives })
+                );
               } catch (e) {}
             } else {
               persistState({ users: INITIAL_USERS });
@@ -814,6 +956,91 @@
           sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(safeSession));
         }
       }, [users]);
+
+      // --- ADMIN WEEKLY ARCHIVE HANDLERS ---
+      const handleBackupCurrentWeekNow = () => {
+        if (!isAdmin) return;
+        const { archives: updatedArchives } = syncWeeklyLogArchives(
+          activityLogs,
+          weeklyLogArchives,
+          true,
+          `Manual Backup by ${currentUser.username} (${formatLogTimestamp(Date.now())})`
+        );
+        setWeeklyLogArchives(updatedArchives);
+        setArchiveFlashMessage("Current week's logs have been backed up into the Admin Weekly Archive.");
+        setTimeout(() => setArchiveFlashMessage(""), 4500);
+        persistState({ weeklyLogArchives: updatedArchives });
+      };
+
+      const handleDeleteWeeklyArchive = (weekStartMs) => {
+        if (!isAdmin) return;
+        const updatedArchives = weeklyLogArchives.filter((a) => a.weekStartMs !== weekStartMs);
+        setWeeklyLogArchives(updatedArchives);
+        if (selectedArchiveWeekFilter === String(weekStartMs)) {
+          setSelectedArchiveWeekFilter("all");
+        }
+        persistState({ weeklyLogArchives: updatedArchives });
+      };
+
+      const handleDownloadArchiveCsv = (archiveObj) => {
+        if (!isAdmin || !archiveObj || !Array.isArray(archiveObj.logs)) return;
+        const headers = [
+          "Timestamp",
+          "User",
+          "Role",
+          "Day",
+          "Line #",
+          "Action",
+          "Summary",
+          "Customer",
+          "Units",
+          "Type",
+          "Booking #",
+          "Ex Grid",
+          "Ctn # Released",
+          "Truck ID",
+          "Time",
+          "Doors",
+          "Comments"
+        ];
+        const escapeCsv = (val) => `"${String(val || "").replace(/"/g, '""')}"`;
+        const rows = archiveObj.logs.map((l) => {
+          const s = l.lineSnapshot || {};
+          return [
+            l.formattedTime,
+            l.username,
+            l.role,
+            l.day,
+            l.lineNo,
+            l.action,
+            l.details,
+            s.customer || l.customer || "",
+            s.units || "",
+            s.type || "",
+            s.bookingNo || l.bookingNo || "",
+            s.exGrid || "",
+            s.ctnReleased || l.ctnReleased || "",
+            s.truckId || l.truckId || "",
+            s.time || "",
+            s.doors || "",
+            s.comment || ""
+          ]
+            .map(escapeCsv)
+            .join(",");
+        });
+
+        const csvContent = [headers.join(","), ...rows].join("\n");
+        const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        const safeLabel = (archiveObj.weekLabel || "Weekly_Log").replace(/[^a-zA-Z0-9_-]+/g, "_");
+        link.href = url;
+        link.download = `Admin_Log_Archive_${safeLabel}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      };
 
       // --- AUTHENTICATION HANDLERS ---
       const handleLoginSubmit = (e) => {
@@ -942,10 +1169,10 @@
           "User Created",
           `Added ${newUserRoleInput} user "${cleanName}" (Default PIN assigned)`
         );
-        const updatedLogs = [logEntry, ...pruneOlderThanSevenDays(activityLogs)];
+        const updatedLogs = [logEntry, ...activityLogs];
 
         setUsers(updatedUsers);
-        setActivityLogs(updatedLogs);
+        setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
         setNewUserNameInput("");
         setNewUserRoleInput("General User");
         setUserMgmtMessage({
@@ -967,10 +1194,10 @@
           "PIN Reset",
           `Reset PIN to default (1111) for user "${targetUser.username}"`
         );
-        const updatedLogs = [logEntry, ...pruneOlderThanSevenDays(activityLogs)];
+        const updatedLogs = [logEntry, ...activityLogs];
 
         setUsers(updatedUsers);
-        setActivityLogs(updatedLogs);
+        setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
         setUserMgmtMessage({
           type: "success",
           text: `PIN for "${targetUser.username}" reset to default (1111).`
@@ -1004,10 +1231,10 @@
           "User Removed",
           `Removed user "${targetUser.username}"`
         );
-        const updatedLogs = [logEntry, ...pruneOlderThanSevenDays(activityLogs)];
+        const updatedLogs = [logEntry, ...activityLogs];
 
         setUsers(updatedUsers);
-        setActivityLogs(updatedLogs);
+        setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
         setUserMgmtMessage({
           type: "success",
           text: `User "${targetUser.username}" removed.`
@@ -1099,7 +1326,6 @@
         );
       };
 
-      // Check whether a row is currently active in its 5-second typing window
       const getRowLockStatus = (day, rowObj, rowIndex) => {
         if (!rowObj) return { isLocked: false, isLockedByOther: false, remainingSec: 0, username: "" };
         const rowKey = rowObj.rowId || `idx-${rowIndex}`;
@@ -1122,7 +1348,6 @@
         const updatedDayData = [...(sheetData[activeDay] || [])];
         if (!updatedDayData[rowIndex]) return;
 
-        // Start or reset the 5-second red highlight & lock timer on every single character typed
         touchRowActivityLock(activeDay, updatedDayData[rowIndex], rowIndex);
 
         let autoTime = updatedDayData[rowIndex].time;
@@ -1181,8 +1406,8 @@
             updatedDayData[rowIndex],
             { field, oldVal, newVal }
           );
-          updatedLogs = [logItem, ...pruneOlderThanSevenDays(activityLogs)];
-          setActivityLogs(updatedLogs);
+          updatedLogs = [logItem, ...activityLogs];
+          setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
           initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
         }
 
@@ -1191,8 +1416,6 @@
           activityLogs: updatedLogs
         });
       };
-
-      const isAdmin = currentUser && currentUser.role === "Admin";
 
       const handleAddRow = () => {
         const currentList = sheetData[activeDay] || [];
@@ -1214,10 +1437,10 @@
         const updatedList = [...currentList, newRow];
         const newSheetData = { ...sheetData, [activeDay]: updatedList };
         const logItem = createLogEntry(activeDay, updatedList.length, "Line Added", "Added new schedule row", newRow);
-        const updatedLogs = [logItem, ...pruneOlderThanSevenDays(activityLogs)];
+        const updatedLogs = [logItem, ...activityLogs];
 
         setSheetData(newSheetData);
-        setActivityLogs(updatedLogs);
+        setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
         initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
         persistState({ daysData: newSheetData, activityLogs: updatedLogs });
       };
@@ -1232,10 +1455,10 @@
         const newSheetData = { ...sheetData, [activeDay]: updatedList };
         const detail = `Removed line (${removedRow.customer || "No Customer"} | Booking: ${removedRow.bookingNo || "N/A"})`;
         const logItem = createLogEntry(activeDay, index + 1, "Line Removed", detail, removedRow);
-        const updatedLogs = [logItem, ...pruneOlderThanSevenDays(activityLogs)];
+        const updatedLogs = [logItem, ...activityLogs];
 
         setSheetData(newSheetData);
-        setActivityLogs(updatedLogs);
+        setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
         initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
         persistState({ daysData: newSheetData, activityLogs: updatedLogs });
       };
@@ -1275,10 +1498,10 @@
           `Moved line #${draggedRowIndex + 1} to #${index + 1} (${draggedItem.customer || "Row"})`,
           draggedItem
         );
-        const updatedLogs = [logItem, ...pruneOlderThanSevenDays(activityLogs)];
+        const updatedLogs = [logItem, ...activityLogs];
 
         setSheetData(newSheetData);
-        setActivityLogs(updatedLogs);
+        setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
         initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
         persistState({ daysData: newSheetData, activityLogs: updatedLogs });
         setDraggedRowIndex(null);
@@ -1286,7 +1509,7 @@
       };
 
       // =======================================================================
-      // SMART IMPORT PARSING WITH EXCELJS (PRESERVES ORIGINAL WORKBOOK TEMPLATE)
+      // SMART IMPORT PARSING WITH EXCELJS
       // =======================================================================
       const handleImportExcel = (e) => {
         const file = e.target.files[0];
@@ -1433,14 +1656,14 @@
           mode === "merge" ? "Excel Merged" : "Excel Overwritten",
           logDescription
         );
-        const updatedLogs = [importLog, ...pruneOlderThanSevenDays(activityLogs)];
+        const updatedLogs = [importLog, ...activityLogs];
 
         setSheetData(finalDaysData);
         setHeaderMetadata(newHeaderMeta);
         setCurrentWorkbookName(importedFileName);
         setWorkbookTemplateBase64(incomingBase64);
         setImportSnapshots(updatedSnapshots);
-        setActivityLogs(updatedLogs);
+        setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
         setPendingImportReview(null);
         initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(finalDaysData));
 
@@ -1486,14 +1709,14 @@
             ? snapshot.workbookTemplateBase64
             : workbookTemplateBase64;
         const updatedSnapshots = [safetyBackup, ...pruneOlderThanSevenDays(importSnapshots)];
-        const updatedLogs = [restoreLog, ...pruneOlderThanSevenDays(activityLogs)];
+        const updatedLogs = [restoreLog, ...activityLogs];
 
         setSheetData(normalizedRestored);
         if (snapshot.headerMetadata) setHeaderMetadata(snapshot.headerMetadata);
         setCurrentWorkbookName(restoredSheetTitle);
         setWorkbookTemplateBase64(restoredTemplate);
         setImportSnapshots(updatedSnapshots);
-        setActivityLogs(updatedLogs);
+        setActivityLogs(pruneOlderThanSevenDays(updatedLogs));
         initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(normalizedRestored));
 
         persistState({
@@ -1532,7 +1755,6 @@
 
             const rowsList = (sheetData[day] || []).filter(isRowValid);
 
-            // Capture original template styles for columns 1..11 from existing data rows (Row 4+)
             const templateColStyles = {};
             const gridStyleByCode = {};
             const templateRow4 = worksheet.getRow(4);
@@ -1556,7 +1778,6 @@
               }
             }
 
-            // Update notice banner in Row 1 Col 10 if edited
             if (notification && notification.trim() !== "") {
               const bannerCell = worksheet.getRow(1).getCell(10);
               if (bannerCell) {
@@ -1564,7 +1785,6 @@
               }
             }
 
-            // Write updated data rows starting at Row 4 while keeping Rows 1..3 completely untouched
             rowsList.forEach((rowObj, idx) => {
               const targetRowNum = 4 + idx;
               const row = worksheet.getRow(targetRowNum);
@@ -1624,7 +1844,6 @@
               row.commit();
             });
 
-            // Clear values beyond rowsList.length
             const oldLastRow = worksheet.rowCount;
             const newLastRow = 3 + rowsList.length;
             for (let r = newLastRow + 1; r <= oldLastRow; r++) {
@@ -1858,9 +2077,8 @@
       // =======================================================================
       const currentDayRows = (sheetData[activeDay] || []).filter((r) => isRowValid(r) || r.isNew);
 
-      const filteredLogs = activityLogs.filter((log) => {
-        if (!logSearchQuery.trim()) return true;
-        const q = logSearchQuery.toLowerCase();
+      const matchesLogSearch = (log, q) => {
+        if (!q) return true;
         const snap = log.lineSnapshot || {};
         return (
           (log.username && log.username.toLowerCase().includes(q)) ||
@@ -1877,13 +2095,18 @@
           (snap.truckId && snap.truckId.toLowerCase().includes(q)) ||
           (log.formattedTime && log.formattedTime.toLowerCase().includes(q))
         );
+      };
+
+      const filteredLogs = activityLogs.filter((log) => {
+        if (!logSearchQuery.trim()) return true;
+        return matchesLogSearch(log, logSearchQuery.toLowerCase());
       });
 
       const isGroupedViewActive = logSearchQuery.trim().length > 0 || forceGroupMode;
 
-      const groupedLogEntries = (() => {
+      const buildGroupedLogs = (logsArr) => {
         const groupsMap = new Map();
-        filteredLogs.forEach((log) => {
+        logsArr.forEach((log) => {
           const snap = log.lineSnapshot || {};
           const booking = (snap.bookingNo || log.bookingNo || "").trim().toUpperCase();
           const customer = (snap.customer || log.customer || "").trim();
@@ -1925,7 +2148,28 @@
           }
         });
         return Array.from(groupsMap.values());
-      })();
+      };
+
+      const groupedLogEntries = buildGroupedLogs(filteredLogs);
+
+      // Filtered Admin Weekly Archives (Admin Only)
+      const filteredWeeklyArchives = isAdmin
+        ? weeklyLogArchives
+            .filter((arch) =>
+              selectedArchiveWeekFilter === "all"
+                ? true
+                : String(arch.weekStartMs) === selectedArchiveWeekFilter
+            )
+            .map((arch) => {
+              const q = logSearchQuery.trim().toLowerCase();
+              const matchingLogs = (arch.logs || []).filter((l) => matchesLogSearch(l, q));
+              return {
+                ...arch,
+                matchingLogs
+              };
+            })
+            .filter((arch) => (logSearchQuery.trim() ? arch.matchingLogs.length > 0 : true))
+        : [];
 
       const renderFullLineLogCard = (log) => {
         const snap = log.lineSnapshot;
@@ -2059,15 +2303,26 @@
                 </button>
               )}
 
-              {/* 7-Day Log & Archive Button */}
+              {/* 7-Day Log & Admin Weekly Archives Button */}
               <button
-                onClick={() => setIsLogModalOpen(true)}
+                onClick={() => {
+                  setLogModalTab("edits");
+                  setIsLogModalOpen(true);
+                }}
                 className="px-3.5 py-2 bg-gray-800 hover:bg-gray-700 text-gray-200 text-sm font-medium rounded-lg border border-gray-700 transition flex items-center gap-2"
               >
                 <span>7-Day Log</span>
                 <span className="text-xs bg-gray-950 text-emerald-400 px-1.5 py-0.5 rounded border border-gray-800">
                   {activityLogs.length}
                 </span>
+                {isAdmin && weeklyLogArchives.length > 0 && (
+                  <span
+                    className="text-[10px] bg-purple-950 text-purple-300 px-1.5 py-0.5 rounded border border-purple-700/60 font-semibold"
+                    title="Admin Weekly Log Archives Available"
+                  >
+                    {weeklyLogArchives.length}W Archive
+                  </span>
+                )}
               </button>
 
               {/* Import Button Available for ALL Users */}
@@ -2888,15 +3143,21 @@
             </div>
           )}
 
-          {/* 7-Day Activity Log & Archive Snapshot Modal */}
+          {/* 7-Day Activity Log, Import Backups & Admin-Only Monday-Anchored Weekly Log Archive Modal */}
           {isLogModalOpen && (
             <div className="fixed inset-0 bg-black/75 flex items-center justify-center p-4 z-50">
               <div className="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-6xl max-h-[88vh] flex flex-col shadow-2xl">
                 <div className="px-6 py-4 border-b border-gray-800 flex items-center justify-between">
                   <div>
-                    <h3 className="text-lg font-bold text-white">7-Day Activity Log & Weekly Snapshots</h3>
+                    <h3 className="text-lg font-bold text-white">
+                      {logModalTab === "admin-archives" && isAdmin
+                        ? "Admin Weekly Log Archives (Monday-to-Sunday Backups)"
+                        : "7-Day Activity Log & Weekly Snapshots"}
+                    </h3>
                     <p className="text-xs text-gray-400">
-                      Every edit captures the full line snapshot. Searching by Booking #, Customer, or User automatically groups edits together.
+                      {logModalTab === "admin-archives" && isAdmin
+                        ? "Restricted to Admin users. Logs are automatically backed up in Monday-to-Sunday weekly bundles so past weeks remain searchable."
+                        : "Every edit captures the full line snapshot. Searching by Booking #, Customer, or User automatically groups edits together."}
                     </p>
                   </div>
                   <button
@@ -2908,7 +3169,7 @@
                 </div>
 
                 <div className="px-6 py-3 bg-gray-950/60 border-b border-gray-800 flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <button
                       onClick={() => setLogModalTab("edits")}
                       className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${
@@ -2929,10 +3190,50 @@
                     >
                       Import Backups ({importSnapshots.length})
                     </button>
+
+                    {/* ADMIN ONLY TAB: Weekly Log Archives (Monday Start) */}
+                    {isAdmin && (
+                      <button
+                        onClick={() => setLogModalTab("admin-archives")}
+                        className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition flex items-center gap-1.5 border ${
+                          logModalTab === "admin-archives"
+                            ? "bg-purple-600 text-white border-purple-400"
+                            : "bg-purple-950/60 text-purple-200 border-purple-700/60 hover:bg-purple-900/60"
+                        }`}
+                      >
+                        <span>Admin Weekly Archives ({weeklyLogArchives.length})</span>
+                      </button>
+                    )}
                   </div>
 
-                  {logModalTab === "edits" && (
+                  {(logModalTab === "edits" || (logModalTab === "admin-archives" && isAdmin)) && (
                     <div className="flex flex-wrap items-center gap-2">
+                      {logModalTab === "admin-archives" && isAdmin && (
+                        <>
+                          <select
+                            value={selectedArchiveWeekFilter}
+                            onChange={(e) => setSelectedArchiveWeekFilter(e.target.value)}
+                            className="bg-gray-900 border border-purple-700/60 focus:border-purple-400 rounded-lg px-2.5 py-1.5 text-xs text-purple-100 focus:outline-none"
+                          >
+                            <option value="all">All Archived Weeks ({weeklyLogArchives.length})</option>
+                            {weeklyLogArchives.map((arch) => (
+                              <option key={arch.id} value={String(arch.weekStartMs)}>
+                                {arch.weekLabel} ({arch.logs ? arch.logs.length : 0})
+                              </option>
+                            ))}
+                          </select>
+
+                          <button
+                            type="button"
+                            onClick={handleBackupCurrentWeekNow}
+                            className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-700 hover:bg-purple-600 text-white transition"
+                            title="Immediately save a backup snapshot of this week's logs"
+                          >
+                            + Snapshot Current Week
+                          </button>
+                        </>
+                      )}
+
                       <button
                         type="button"
                         onClick={() => setForceGroupMode(!forceGroupMode)}
@@ -2951,7 +3252,7 @@
                           value={logSearchQuery}
                           onChange={(e) => setLogSearchQuery(e.target.value)}
                           placeholder="Search Booking #, Customer, User, Ctn #..."
-                          className="bg-gray-900 border border-gray-700 focus:border-emerald-500 rounded-lg px-3 py-1.5 text-xs text-gray-100 w-72 focus:outline-none pr-7"
+                          className="bg-gray-900 border border-gray-700 focus:border-emerald-500 rounded-lg px-3 py-1.5 text-xs text-gray-100 w-64 sm:w-72 focus:outline-none pr-7"
                         />
                         {logSearchQuery && (
                           <button
@@ -2968,7 +3269,114 @@
                 </div>
 
                 <div className="flex-1 overflow-auto p-6">
-                  {logModalTab === "edits" ? (
+                  {logModalTab === "admin-archives" && isAdmin ? (
+                    <div className="space-y-5">
+                      {archiveFlashMessage && (
+                        <div className="bg-purple-950/70 border border-purple-700/70 text-purple-200 text-xs rounded-lg px-4 py-2.5">
+                          {archiveFlashMessage}
+                        </div>
+                      )}
+
+                      {filteredWeeklyArchives.length === 0 ? (
+                        <div className="text-center py-12 text-gray-400 text-sm space-y-2">
+                          <p>
+                            {logSearchQuery.trim()
+                              ? "No archived weekly log entries matched your search."
+                              : "No completed Monday-to-Sunday weekly log archives stored yet."}
+                          </p>
+                          <p className="text-xs text-gray-500">
+                            Every Monday, the previous week's logs are automatically backed up here—or click "+ Snapshot Current Week" above to archive this week right now.
+                          </p>
+                        </div>
+                      ) : (
+                        filteredWeeklyArchives.map((arch) => {
+                          const displayLogs = arch.matchingLogs || [];
+                          const groupedArchiveLogs = isGroupedViewActive
+                            ? buildGroupedLogs(displayLogs)
+                            : [];
+
+                          return (
+                            <div
+                              key={arch.id}
+                              className="bg-gray-900/80 border border-purple-800/50 rounded-xl overflow-hidden shadow-xl"
+                            >
+                              <div className="bg-purple-950/40 px-4 py-3 border-b border-purple-800/50 flex flex-wrap items-center justify-between gap-3">
+                                <div className="flex flex-wrap items-center gap-2.5">
+                                  <span className="px-2 py-0.5 rounded bg-purple-700 text-white text-[10px] font-bold uppercase">
+                                    Admin Archive
+                                  </span>
+                                  <span className="text-sm font-bold text-white">
+                                    {arch.weekLabel}
+                                  </span>
+                                  <span className="text-xs bg-gray-950 text-purple-300 border border-purple-800/60 px-2.5 py-0.5 rounded-full font-mono">
+                                    {displayLogs.length} {displayLogs.length === 1 ? "Entry" : "Entries"}
+                                  </span>
+                                  {arch.backupNote && (
+                                    <span className="text-[11px] text-gray-400">
+                                      • {arch.backupNote}
+                                    </span>
+                                  )}
+                                </div>
+
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDownloadArchiveCsv(arch)}
+                                    className="px-3 py-1 bg-gray-800 hover:bg-gray-700 text-emerald-300 text-xs font-semibold rounded border border-gray-700 transition"
+                                  >
+                                    Export CSV
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteWeeklyArchive(arch.weekStartMs)}
+                                    className="px-2.5 py-1 bg-rose-950/50 hover:bg-rose-900/60 text-rose-300 text-xs rounded border border-rose-800/50 transition"
+                                    title="Delete this weekly archive"
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="p-4 space-y-3">
+                                {isGroupedViewActive
+                                  ? groupedArchiveLogs.map((group) => (
+                                      <div
+                                        key={group.key}
+                                        className="bg-gray-950/70 border border-gray-800 rounded-xl overflow-hidden"
+                                      >
+                                        <div className="bg-gray-800/60 px-4 py-2.5 border-b border-gray-800 flex flex-wrap items-center justify-between gap-2">
+                                          <div className="flex flex-wrap items-center gap-2">
+                                            <span className="text-xs font-bold text-white">
+                                              {group.title}
+                                            </span>
+                                            {group.subtitle && (
+                                              <span className="text-xs text-gray-400">
+                                                ({group.subtitle})
+                                              </span>
+                                            )}
+                                            {group.latestCtn && (
+                                              <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800/60">
+                                                Ctn: {group.latestCtn}
+                                              </span>
+                                            )}
+                                          </div>
+                                          <span className="text-[11px] font-mono text-gray-400">
+                                            {group.logs.length} {group.logs.length === 1 ? "Edit" : "Edits"}
+                                          </span>
+                                        </div>
+                                        <div className="p-3 space-y-2">
+                                          {group.logs.map((log) => renderFullLineLogCard(log))}
+                                        </div>
+                                      </div>
+                                    ))
+                                  : displayLogs.map((log) => renderFullLineLogCard(log))}
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  ) : logModalTab === "edits" ? (
                     filteredLogs.length === 0 ? (
                       <div className="text-center py-12 text-gray-500 text-sm">
                         No log entries found matching your filter within the last 7 days.
