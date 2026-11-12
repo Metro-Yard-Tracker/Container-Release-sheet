@@ -13,8 +13,8 @@
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   
-  <!-- SheetJS with Full Cell Style Support (xlsx-js-style) -->
-  <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
+  <!-- ExcelJS (Preserves 100% of Native Excel Theme Colors, RGB Fills, Borders, Fonts & Merges) -->
+  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
   
   <!-- Firebase SDKs -->
   <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
@@ -82,7 +82,7 @@
 
     const DOOR_OPTIONS = ["Forward", "Rear", "Passengers", "Drivers"];
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v4";
+    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v5";
     const SESSION_STORAGE_KEY = "container_release_active_user_v1";
     const DEFAULT_PIN = "1111";
 
@@ -107,13 +107,13 @@
       "AV5": "bg-rose-950/80 text-rose-300 border-rose-700/60"
     };
 
-    // Fallback Excel RGB Hex Fills for Ex Grid if template has no explicit fill for a grid code
-    const EXCEL_GRID_FILL_FALLBACK = {
-      "AV1": "BDD7EE",
-      "AV2": "E4DFEC",
-      "AV3": "FFE699",
-      "AV4": "C6E0B4",
-      "AV5": "F8CBAD"
+    // Fallback ARGB Fills for Ex Grid if template doesn't already have a style for that grid code
+    const EXCEL_GRID_ARGB_FALLBACK = {
+      "AV1": "FFBDD7EE",
+      "AV2": "FFE4DFEC",
+      "AV3": "FFFFE699",
+      "AV4": "FFC6E0B4",
+      "AV5": "FFF8CBAD"
     };
 
     const DEFAULT_GRID_STYLE = "bg-gray-800 text-gray-300 border-gray-700";
@@ -175,7 +175,6 @@
       return normalized;
     };
 
-    // Convert ArrayBuffer to Base64 safely in chunks
     const arrayBufferToBase64 = (buffer) => {
       const bytes = new Uint8Array(buffer);
       const chunkSize = 0x8000;
@@ -187,25 +186,37 @@
       return btoa(binary);
     };
 
-    // Convert Base64 back to Uint8Array
-    const base64ToUint8Array = (base64) => {
+    const base64ToArrayBuffer = (base64) => {
       const binary = atob(base64);
       const len = binary.length;
       const bytes = new Uint8Array(len);
       for (let i = 0; i < len; i++) {
         bytes[i] = binary.charCodeAt(i);
       }
-      return bytes;
+      return bytes.buffer;
     };
 
-    // Deep clone cell style object safely
-    const cloneStyle = (styleObj) => {
-      if (!styleObj) return undefined;
+    const cloneExcelStyle = (styleObj) => {
+      if (!styleObj) return {};
       try {
         return JSON.parse(JSON.stringify(styleObj));
       } catch (e) {
-        return undefined;
+        return {};
       }
+    };
+
+    // Extract plain text safely from an ExcelJS cell (handles formulas, richText, numbers, strings)
+    const getExcelCellText = (cell) => {
+      if (!cell || cell.value === null || cell.value === undefined) return "";
+      const val = cell.value;
+      if (typeof val === "object") {
+        if (val.result !== undefined && val.result !== null) return String(val.result).trim();
+        if (Array.isArray(val.richText)) {
+          return val.richText.map((part) => part.text || "").join("").trim();
+        }
+        if (val.text !== undefined) return String(val.text).trim();
+      }
+      return String(val).trim();
     };
 
     // Smart matching and diff calculation between existing week data and newly imported Excel data
@@ -553,7 +564,6 @@
         return "";
       });
 
-      // Stores the Base64 binary of the exact original imported Excel workbook so colors, borders & layout are preserved on export
       const [workbookTemplateBase64, setWorkbookTemplateBase64] = useState(() => {
         try {
           const cached = localStorage.getItem(LOCAL_STORAGE_KEY);
@@ -1167,7 +1177,7 @@
       };
 
       // =======================================================================
-      // SMART IMPORT PARSING, COMPARISON & MERGE / OVERWRITE EXECUTION
+      // SMART IMPORT PARSING WITH EXCELJS (PRESERVES ORIGINAL WORKBOOK TEMPLATE)
       // =======================================================================
       const handleImportExcel = (e) => {
         const file = e.target.files[0];
@@ -1175,77 +1185,94 @@
         const importedFileName = file.name;
 
         const reader = new FileReader();
-        reader.onload = (evt) => {
-          const arrayBuffer = evt.target.result;
-          const data = new Uint8Array(arrayBuffer);
-          const incomingBase64 = arrayBufferToBase64(arrayBuffer);
-          const workbook = XLSX.read(data, { type: "array", cellStyles: true });
+        reader.onload = async (evt) => {
+          try {
+            const arrayBuffer = evt.target.result;
+            const incomingBase64 = arrayBufferToBase64(arrayBuffer);
 
-          const parsedIncomingDays = createEmptyDaysObject();
-          const newHeaderMeta = { ...headerMetadata };
-          let totalIncomingRows = 0;
+            const workbook = new ExcelJS.Workbook();
+            await workbook.xlsx.load(arrayBuffer);
 
-          workbook.SheetNames.forEach((sheetName) => {
-            const matchedDay = DAYS.find((d) => sheetName.toLowerCase().includes(d.toLowerCase()));
-            if (matchedDay) {
-              const worksheet = workbook.Sheets[sheetName];
-              const rawRows = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+            const parsedIncomingDays = createEmptyDaysObject();
+            const newHeaderMeta = { ...headerMetadata };
+            let totalIncomingRows = 0;
 
-              const headers = rawRows.slice(0, 3);
-              if (headers.length > 0) {
-                newHeaderMeta[matchedDay] = headers;
+            workbook.eachSheet((worksheet) => {
+              const sheetName = worksheet.name;
+              const matchedDay = DAYS.find((d) => sheetName.toLowerCase().includes(d.toLowerCase()));
+              if (matchedDay) {
+                // Capture first 3 header rows for metadata
+                const headers = [];
+                for (let r = 1; r <= 3; r++) {
+                  const rowObj = worksheet.getRow(r);
+                  const rowArr = [];
+                  for (let c = 1; c <= 11; c++) {
+                    rowArr.push(getExcelCellText(rowObj.getCell(c)));
+                  }
+                  headers.push(rowArr);
+                }
+                if (headers.length > 0) {
+                  newHeaderMeta[matchedDay] = headers;
+                }
+
+                // Parse data rows from Row 4 downward
+                const parsedRows = [];
+                worksheet.eachRow({ includeEmpty: false }, (rowObj, rowNumber) => {
+                  if (rowNumber <= 3) return;
+                  const rowData = {
+                    lineNo: parsedRows.length + 1,
+                    customer: getExcelCellText(rowObj.getCell(2)),
+                    units: getExcelCellText(rowObj.getCell(3)) || "1",
+                    type: getExcelCellText(rowObj.getCell(4)),
+                    bookingNo: getExcelCellText(rowObj.getCell(5)),
+                    exGrid: getExcelCellText(rowObj.getCell(6)).toUpperCase(),
+                    ctnReleased: getExcelCellText(rowObj.getCell(7)),
+                    truckId: getExcelCellText(rowObj.getCell(8)),
+                    time: format24HrTime(getExcelCellText(rowObj.getCell(9))),
+                    doors: getExcelCellText(rowObj.getCell(10)) || "Forward",
+                    comment: getExcelCellText(rowObj.getCell(11))
+                  };
+                  if (isRowValid(rowData)) {
+                    parsedRows.push(rowData);
+                  }
+                });
+
+                totalIncomingRows += parsedRows.length;
+                parsedIncomingDays[matchedDay] = parsedRows;
               }
+            });
 
-              const dataRows = rawRows.slice(3);
-              const parsedRows = dataRows
-                .map((r, idx) => ({
-                  lineNo: idx + 1,
-                  customer: r[1] !== undefined ? String(r[1]).trim() : "",
-                  units: r[2] !== undefined ? String(r[2]).trim() : "1",
-                  type: r[3] !== undefined ? String(r[3]).trim() : "",
-                  bookingNo: r[4] !== undefined ? String(r[4]).trim() : "",
-                  exGrid: r[5] !== undefined ? String(r[5]).trim().toUpperCase() : "",
-                  ctnReleased: r[6] !== undefined ? String(r[6]).trim() : "",
-                  truckId: r[7] !== undefined ? String(r[7]).trim() : "",
-                  time: format24HrTime(r[8] || ""),
-                  doors: r[9] !== undefined ? String(r[9]).trim() : "Forward",
-                  comment: r[10] !== undefined ? String(r[10]).trim() : ""
-                }))
-                .filter(isRowValid);
+            const hasExistingRows = DAYS.some((d) => (sheetData[d] || []).filter(isRowValid).length > 0);
 
-              totalIncomingRows += parsedRows.length;
-              parsedIncomingDays[matchedDay] = parsedRows;
+            if (!hasExistingRows) {
+              applyImportAction("overwrite", {
+                importedFileName,
+                incomingBase64,
+                incomingDays: parsedIncomingDays,
+                mergedDays: parsedIncomingDays,
+                newHeaderMeta,
+                totalIncomingRows,
+                summary: { addedCount: totalIncomingRows, updatedCount: 0, unchangedCount: 0, removedCount: 0, items: [] }
+              });
+            } else {
+              const { mergedDays, summary } = computeImportAnalysis(sheetData, parsedIncomingDays);
+              setPendingImportReview({
+                importedFileName,
+                incomingBase64,
+                incomingDays: parsedIncomingDays,
+                mergedDays,
+                newHeaderMeta,
+                totalIncomingRows,
+                summary
+              });
             }
-          });
-
-          const hasExistingRows = DAYS.some((d) => (sheetData[d] || []).filter(isRowValid).length > 0);
-
-          if (!hasExistingRows) {
-            applyImportAction("overwrite", {
-              importedFileName,
-              incomingBase64,
-              incomingDays: parsedIncomingDays,
-              mergedDays: parsedIncomingDays,
-              newHeaderMeta,
-              totalIncomingRows,
-              summary: { addedCount: totalIncomingRows, updatedCount: 0, unchangedCount: 0, removedCount: 0, items: [] }
-            });
-          } else {
-            const { mergedDays, summary } = computeImportAnalysis(sheetData, parsedIncomingDays);
-            setPendingImportReview({
-              importedFileName,
-              incomingBase64,
-              incomingDays: parsedIncomingDays,
-              mergedDays,
-              newHeaderMeta,
-              totalIncomingRows,
-              summary
-            });
+          } catch (err) {
+            console.error("Import error:", err);
+            alert("Could not read this Excel file. Please ensure it is a valid .xlsx workbook.");
           }
-
-          e.target.value = "";
         };
         reader.readAsArrayBuffer(file);
+        e.target.value = "";
       };
 
       const applyImportAction = (mode, reviewPayload) => {
@@ -1373,76 +1400,80 @@
       };
 
       // =======================================================================
-      // STYLE-PRESERVING EXCEL EXPORT (USES ORIGINAL IMPORTED .XLSX AS TEMPLATE)
+      // NATIVE EXCELJS EXPORT (PRESERVES ALL ORIGINAL BORDERS, COLORS & LAYOUT)
       // =======================================================================
-      const handleExportExcel = () => {
-        // If no Excel file has been imported yet, show the clear alert pop-up
+      const handleExportExcel = async () => {
         if (!workbookTemplateBase64) {
           setIsNoTemplateAlertOpen(true);
           return;
         }
 
         try {
-          const rawBytes = base64ToUint8Array(workbookTemplateBase64);
-          const wb = XLSX.read(rawBytes, { type: "array", cellStyles: true });
+          const arrayBuffer = base64ToArrayBuffer(workbookTemplateBase64);
+          const workbook = new ExcelJS.Workbook();
+          await workbook.xlsx.load(arrayBuffer);
 
           DAYS.forEach((day) => {
-            const matchedSheetName = wb.SheetNames.find((s) =>
-              s.toLowerCase().includes(day.toLowerCase())
-            );
-            if (!matchedSheetName) return;
+            let worksheet = null;
+            workbook.eachSheet((ws) => {
+              if (!worksheet && ws.name.toLowerCase().includes(day.toLowerCase())) {
+                worksheet = ws;
+              }
+            });
+            if (!worksheet) return;
 
-            const ws = wb.Sheets[matchedSheetName];
             const rowsList = (sheetData[day] || []).filter(isRowValid);
-            const currentRange = XLSX.utils.decode_range(ws["!ref"] || "A1:K25");
 
-            // Capture original template styles for columns A..K (0..10) from existing data rows (Row 4+)
+            // Capture original template styles for columns 1..11 from existing data rows (Row 4+)
             const templateColStyles = {};
             const gridStyleByCode = {};
-            const maxScanRow = Math.max(currentRange.e.r, 10);
+            const templateRow4 = worksheet.getRow(4);
+            const templateRowHeight = templateRow4 && templateRow4.height ? templateRow4.height : undefined;
 
-            for (let r = 3; r <= maxScanRow; r++) {
-              const gridCell = ws[XLSX.utils.encode_cell({ r, c: 5 })];
-              const gridCode =
-                gridCell && gridCell.v !== undefined
-                  ? String(gridCell.v).trim().toUpperCase()
-                  : "";
+            const scanLimit = Math.max(worksheet.rowCount, 12);
+            for (let r = 4; r <= scanLimit; r++) {
+              const scanRow = worksheet.getRow(r);
+              const gridCode = getExcelCellText(scanRow.getCell(6)).toUpperCase();
 
-              for (let c = 0; c <= 10; c++) {
-                const cell = ws[XLSX.utils.encode_cell({ r, c })];
-                if (cell && cell.s) {
+              for (let c = 1; c <= 11; c++) {
+                const cell = scanRow.getCell(c);
+                if (cell && cell.style && Object.keys(cell.style).length > 0) {
                   if (!templateColStyles[c]) {
-                    templateColStyles[c] = cloneStyle(cell.s);
+                    templateColStyles[c] = cloneExcelStyle(cell.style);
                   }
-                  if (c === 5 && gridCode && !gridStyleByCode[gridCode]) {
-                    gridStyleByCode[gridCode] = cloneStyle(cell.s);
+                  if (c === 6 && gridCode && !gridStyleByCode[gridCode]) {
+                    gridStyleByCode[gridCode] = cloneExcelStyle(cell.style);
                   }
                 }
               }
             }
 
-            // Capture template row height from Row 4 (index 3) if defined
-            const templateRowHeight =
-              ws["!rows"] && ws["!rows"][3] ? { ...ws["!rows"][3] } : undefined;
-
-            // Update notice banner in Row 1 if edited in app
+            // Update notice banner in Row 1 Col 10 if edited
             if (notification && notification.trim() !== "") {
-              const bannerCellAddr = XLSX.utils.encode_cell({ r: 0, c: 9 });
-              if (ws[bannerCellAddr]) {
-                ws[bannerCellAddr].v = notification;
+              const bannerCell = worksheet.getRow(1).getCell(10);
+              if (bannerCell) {
+                bannerCell.value = notification;
               }
             }
 
-            // Write updated data rows starting at Row 4 (index 3) while keeping rows 0..2 untouched
-            const totalDataCols = Math.max(currentRange.e.c, 10);
-
+            // Write updated data rows starting at Row 4 while keeping Rows 1..3 completely untouched
             rowsList.forEach((rowObj, idx) => {
-              const targetR = 3 + idx;
-              const rowValues = [
+              const targetRowNum = 4 + idx;
+              const row = worksheet.getRow(targetRowNum);
+              if (templateRowHeight) {
+                row.height = templateRowHeight;
+              }
+
+              const unitsVal =
+                rowObj.units !== "" && !isNaN(Number(rowObj.units))
+                  ? Number(rowObj.units)
+                  : rowObj.units || "";
+
+              const values = [
                 idx + 1,
                 rowObj.customer || "",
-                rowObj.units || "",
-                rowObj.type || "",
+                unitsVal,
+                (rowObj.type || "").toUpperCase(),
                 rowObj.bookingNo || "",
                 (rowObj.exGrid || "").toUpperCase(),
                 (rowObj.ctnReleased || "").toUpperCase(),
@@ -1452,95 +1483,69 @@
                 rowObj.comment || ""
               ];
 
-              if (templateRowHeight) {
-                ws["!rows"] = ws["!rows"] || [];
-                if (!ws["!rows"][targetR]) {
-                  ws["!rows"][targetR] = { ...templateRowHeight };
-                }
-              }
+              for (let c = 1; c <= 11; c++) {
+                const cell = row.getCell(c);
+                const existingStyle =
+                  cell.style && Object.keys(cell.style).length > 0
+                    ? cloneExcelStyle(cell.style)
+                    : cloneExcelStyle(templateColStyles[c]);
 
-              for (let c = 0; c <= 10; c++) {
-                const addr = XLSX.utils.encode_cell({ r: targetR, c });
-                const existingCell = ws[addr];
-                const preservedStyle =
-                  (existingCell && existingCell.s ? cloneStyle(existingCell.s) : null) ||
-                  cloneStyle(templateColStyles[c]) ||
-                  {
-                    font: { name: "Calibri", sz: 11 },
-                    border: {
-                      top: { style: "thin", color: { rgb: "D9D9D9" } },
-                      bottom: { style: "thin", color: { rgb: "D9D9D9" } },
-                      left: { style: "thin", color: { rgb: "D9D9D9" } },
-                      right: { style: "thin", color: { rgb: "D9D9D9" } }
-                    }
-                  };
+                cell.value = values[c - 1];
 
-                // Preserve or apply exact AV Grid color fill on Column F (Ex Grid, c === 5)
-                if (c === 5) {
+                if (c === 6) {
                   const gridUpper = (rowObj.exGrid || "").trim().toUpperCase();
                   if (gridStyleByCode[gridUpper]) {
-                    ws[addr] = {
-                      v: rowValues[c],
-                      t: "s",
-                      s: cloneStyle(gridStyleByCode[gridUpper])
-                    };
-                    continue;
-                  } else if (EXCEL_GRID_FILL_FALLBACK[gridUpper]) {
-                    preservedStyle.fill = {
-                      patternType: "solid",
-                      fgColor: { rgb: EXCEL_GRID_FILL_FALLBACK[gridUpper] }
-                    };
-                    preservedStyle.font = {
-                      ...(preservedStyle.font || {}),
-                      bold: true
-                    };
-                    preservedStyle.alignment = {
-                      ...(preservedStyle.alignment || {}),
-                      horizontal: "center",
-                      vertical: "center"
-                    };
+                    cell.style = cloneExcelStyle(gridStyleByCode[gridUpper]);
+                  } else {
+                    if (existingStyle && Object.keys(existingStyle).length > 0) {
+                      cell.style = existingStyle;
+                    }
+                    if (EXCEL_GRID_ARGB_FALLBACK[gridUpper]) {
+                      cell.fill = {
+                        type: "pattern",
+                        pattern: "solid",
+                        fgColor: { argb: EXCEL_GRID_ARGB_FALLBACK[gridUpper] }
+                      };
+                    }
                   }
+                } else if (existingStyle && Object.keys(existingStyle).length > 0) {
+                  cell.style = existingStyle;
                 }
-
-                const val = rowValues[c];
-                const isNumericCol = (c === 0 || c === 2) && val !== "" && !isNaN(Number(val));
-
-                ws[addr] = {
-                  v: isNumericCol ? Number(val) : val,
-                  t: isNumericCol ? "n" : "s",
-                  s: preservedStyle
-                };
               }
+
+              row.commit();
             });
 
-            // Clear any leftover rows from the original template beyond rowsList.length
-            const oldLastRow = currentRange.e.r;
-            const newLastRow = Math.max(2, 3 + rowsList.length - 1);
+            // Clear values (while keeping table grid borders/styles or clearing excess rows cleanly) beyond rowsList.length
+            const oldLastRow = worksheet.rowCount;
+            const newLastRow = 3 + rowsList.length;
             for (let r = newLastRow + 1; r <= oldLastRow; r++) {
-              for (let c = 0; c <= totalDataCols; c++) {
-                const addr = XLSX.utils.encode_cell({ r, c });
-                if (ws[addr]) {
-                  delete ws[addr];
-                }
+              const extraRow = worksheet.getRow(r);
+              for (let c = 1; c <= 11; c++) {
+                extraRow.getCell(c).value = null;
               }
+              extraRow.commit();
             }
-
-            // Update sheet bounds (!ref) cleanly
-            ws["!ref"] = XLSX.utils.encode_range({
-              s: { r: 0, c: 0 },
-              e: { r: newLastRow, c: totalDataCols }
-            });
           });
 
+          const outBuffer = await workbook.xlsx.writeBuffer();
+          const blob = new Blob([outBuffer], {
+            type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement("a");
           const baseName = currentWorkbookName
             ? currentWorkbookName.replace(/\.xlsx?$/i, "")
             : "Mty_Container_Release_Sheet";
-          XLSX.writeFile(wb, `${baseName}_Updated_${new Date().toISOString().slice(0, 10)}.xlsx`, {
-            cellStyles: true
-          });
+          link.href = url;
+          link.download = `${baseName}_Updated_${new Date().toISOString().slice(0, 10)}.xlsx`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
         } catch (err) {
-          console.error("Styled export error:", err);
-          alert("There was an issue exporting the workbook. Please try re-importing the master Excel file.");
+          console.error("ExcelJS export error:", err);
+          alert("There was an issue exporting the workbook. Please try re-importing your master .xlsx file first.");
         }
       };
 
@@ -1952,7 +1957,7 @@
                 type="file"
                 ref={fileInputRef}
                 onChange={handleImportExcel}
-                accept=".xlsx, .xls"
+                accept=".xlsx"
                 className="hidden"
               />
               <button
@@ -2294,7 +2299,7 @@
                   <div>
                     <h3 className="text-lg font-bold text-white">No Imported Sheet Found</h3>
                     <p className="text-sm text-gray-300 mt-1.5 leading-relaxed">
-                      There is currently no imported master Excel sheet loaded. Because exports preserve the exact formatting and colors of your original spreadsheet, please import a master <code className="text-amber-300">.xlsx</code> sheet first before exporting.
+                      There is currently no imported master Excel sheet loaded. Because exports preserve the exact borders, colors, and formatting of your original spreadsheet, please import a master <code className="text-amber-300">.xlsx</code> sheet first before exporting.
                     </p>
                   </div>
                 </div>
