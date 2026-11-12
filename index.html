@@ -80,6 +80,11 @@
       "Sunday"
     ];
 
+    const getCurrentDayName = () => {
+      const jsDay = new Date().getDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+      return jsDay === 0 ? "Sunday" : DAYS[jsDay - 1];
+    };
+
     const DOOR_OPTIONS = ["Forward", "Rear", "Passengers", "Drivers"];
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
     const ROW_LOCK_DURATION_MS = 5000; // 5 seconds from first character until 5 seconds after last character
