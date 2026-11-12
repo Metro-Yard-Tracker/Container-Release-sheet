@@ -128,6 +128,8 @@
       comment: "Comment"
     };
 
+    const SCHEDULE_FIELDS = ["customer", "units", "type", "bookingNo", "exGrid"];
+
     const SNAPSHOT_COLUMNS = [
       { key: "customer", label: "Customer" },
       { key: "units", label: "Units" },
@@ -162,6 +164,267 @@
         }
       });
       return normalized;
+    };
+
+    // Smart matching and diff calculation between existing week data and newly imported Excel data
+    const computeImportAnalysis = (currentDays, incomingDays) => {
+      const mergedDays = createEmptyDaysObject();
+      const summary = {
+        addedCount: 0,
+        updatedCount: 0,
+        unchangedCount: 0,
+        removedCount: 0,
+        items: []
+      };
+
+      DAYS.forEach((day) => {
+        const existingRows = (currentDays[day] || []).filter(
+          (r) =>
+            r &&
+            ((r.customer && r.customer.trim()) ||
+              (r.bookingNo && r.bookingNo.trim()) ||
+              (r.type && r.type.trim()) ||
+              (r.exGrid && r.exGrid.trim()) ||
+              (r.ctnReleased && r.ctnReleased.trim()))
+        );
+        const incomingRows = incomingDays[day] || [];
+
+        const usedExistingIndices = new Set();
+        const usedIncomingIndices = new Set();
+        const updatedExistingMap = new Map(); // existingIdx -> { updatedRow, diffs }
+
+        // Pass 1: Exact composite match (Customer + Booking # + Type + ExGrid)
+        incomingRows.forEach((inc, incIdx) => {
+          const incCust = (inc.customer || "").trim().toLowerCase();
+          const incBkg = (inc.bookingNo || "").trim().toLowerCase();
+          const incType = (inc.type || "").trim().toLowerCase();
+          const incGrid = (inc.exGrid || "").trim().toLowerCase();
+
+          const matchIdx = existingRows.findIndex((ex, exIdx) => {
+            if (usedExistingIndices.has(exIdx)) return false;
+            return (
+              (ex.customer || "").trim().toLowerCase() === incCust &&
+              (ex.bookingNo || "").trim().toLowerCase() === incBkg &&
+              (ex.type || "").trim().toLowerCase() === incType &&
+              (ex.exGrid || "").trim().toLowerCase() === incGrid
+            );
+          });
+
+          if (matchIdx !== -1) {
+            usedExistingIndices.add(matchIdx);
+            usedIncomingIndices.add(incIdx);
+
+            const ex = existingRows[matchIdx];
+            const diffs = [];
+            SCHEDULE_FIELDS.forEach((field) => {
+              const oldVal = (ex[field] || "").toString().trim();
+              const newVal = (inc[field] || "").toString().trim();
+              if (oldVal !== newVal) {
+                diffs.push({
+                  field,
+                  label: FIELD_LABELS[field] || field,
+                  oldVal: oldVal || "Empty",
+                  newVal: newVal || "Empty"
+                });
+              }
+            });
+
+            if (diffs.length > 0) {
+              const mergedRow = {
+                ...ex,
+                customer: inc.customer || ex.customer,
+                units: inc.units || ex.units,
+                type: inc.type || ex.type,
+                bookingNo: inc.bookingNo || ex.bookingNo,
+                exGrid: inc.exGrid || ex.exGrid
+              };
+              updatedExistingMap.set(matchIdx, { updatedRow: mergedRow, diffs });
+              summary.updatedCount += 1;
+              summary.items.push({
+                type: "updated",
+                day,
+                lineNo: matchIdx + 1,
+                customer: mergedRow.customer,
+                bookingNo: mergedRow.bookingNo,
+                exGrid: mergedRow.exGrid,
+                ctnReleased: mergedRow.ctnReleased,
+                truckId: mergedRow.truckId,
+                diffs
+              });
+            } else {
+              summary.unchangedCount += 1;
+            }
+          }
+        });
+
+        // Pass 2: Same row position fallback (catches Booking # edits on the same line, e.g. same Customer/Type/Grid at same index)
+        incomingRows.forEach((inc, incIdx) => {
+          if (usedIncomingIndices.has(incIdx)) return;
+          if (incIdx < existingRows.length && !usedExistingIndices.has(incIdx)) {
+            const ex = existingRows[incIdx];
+            const sameCustomer =
+              (ex.customer || "").trim().toLowerCase() === (inc.customer || "").trim().toLowerCase();
+            const sameBooking =
+              (ex.bookingNo || "").trim().toLowerCase() === (inc.bookingNo || "").trim().toLowerCase() &&
+              (inc.bookingNo || "").trim() !== "";
+
+            if (sameCustomer || sameBooking) {
+              usedExistingIndices.add(incIdx);
+              usedIncomingIndices.add(incIdx);
+
+              const diffs = [];
+              SCHEDULE_FIELDS.forEach((field) => {
+                const oldVal = (ex[field] || "").toString().trim();
+                const newVal = (inc[field] || "").toString().trim();
+                if (oldVal !== newVal) {
+                  diffs.push({
+                    field,
+                    label: FIELD_LABELS[field] || field,
+                    oldVal: oldVal || "Empty",
+                    newVal: newVal || "Empty"
+                  });
+                }
+              });
+
+              const mergedRow = {
+                ...ex,
+                customer: inc.customer,
+                units: inc.units,
+                type: inc.type,
+                bookingNo: inc.bookingNo,
+                exGrid: inc.exGrid
+              };
+
+              if (diffs.length > 0) {
+                updatedExistingMap.set(incIdx, { updatedRow: mergedRow, diffs });
+                summary.updatedCount += 1;
+                summary.items.push({
+                  type: "updated",
+                  day,
+                  lineNo: incIdx + 1,
+                  customer: mergedRow.customer,
+                  bookingNo: mergedRow.bookingNo,
+                  exGrid: mergedRow.exGrid,
+                  ctnReleased: mergedRow.ctnReleased,
+                  truckId: mergedRow.truckId,
+                  diffs
+                });
+              } else {
+                summary.unchangedCount += 1;
+              }
+            }
+          }
+        });
+
+        // Pass 3: Secondary match on (Customer + Booking #) anywhere in that day (e.g. Ex Grid or Type updated)
+        incomingRows.forEach((inc, incIdx) => {
+          if (usedIncomingIndices.has(incIdx)) return;
+          const incCust = (inc.customer || "").trim().toLowerCase();
+          const incBkg = (inc.bookingNo || "").trim().toLowerCase();
+          if (!incCust && !incBkg) return;
+
+          const matchIdx = existingRows.findIndex((ex, exIdx) => {
+            if (usedExistingIndices.has(exIdx)) return false;
+            return (
+              (ex.customer || "").trim().toLowerCase() === incCust &&
+              (ex.bookingNo || "").trim().toLowerCase() === incBkg
+            );
+          });
+
+          if (matchIdx !== -1) {
+            usedExistingIndices.add(matchIdx);
+            usedIncomingIndices.add(incIdx);
+
+            const ex = existingRows[matchIdx];
+            const diffs = [];
+            SCHEDULE_FIELDS.forEach((field) => {
+              const oldVal = (ex[field] || "").toString().trim();
+              const newVal = (inc[field] || "").toString().trim();
+              if (oldVal !== newVal) {
+                diffs.push({
+                  field,
+                  label: FIELD_LABELS[field] || field,
+                  oldVal: oldVal || "Empty",
+                  newVal: newVal || "Empty"
+                });
+              }
+            });
+
+            const mergedRow = {
+              ...ex,
+              customer: inc.customer,
+              units: inc.units,
+              type: inc.type,
+              bookingNo: inc.bookingNo,
+              exGrid: inc.exGrid
+            };
+
+            if (diffs.length > 0) {
+              updatedExistingMap.set(matchIdx, { updatedRow: mergedRow, diffs });
+              summary.updatedCount += 1;
+              summary.items.push({
+                type: "updated",
+                day,
+                lineNo: matchIdx + 1,
+                customer: mergedRow.customer,
+                bookingNo: mergedRow.bookingNo,
+                exGrid: mergedRow.exGrid,
+                ctnReleased: mergedRow.ctnReleased,
+                truckId: mergedRow.truckId,
+                diffs
+              });
+            } else {
+              summary.unchangedCount += 1;
+            }
+          }
+        });
+
+        // Build final merged list for this day:
+        // Keep all existing rows (with updated schedule fields where matched, preserving Ctn/Truck/Time/Doors/Comments)
+        const dayMergedList = existingRows.map((ex, exIdx) => {
+          if (!usedExistingIndices.has(exIdx)) {
+            summary.removedCount += 1;
+            summary.items.push({
+              type: "removed",
+              day,
+              lineNo: exIdx + 1,
+              customer: ex.customer,
+              bookingNo: ex.bookingNo,
+              typeCode: ex.type,
+              exGrid: ex.exGrid,
+              ctnReleased: ex.ctnReleased,
+              truckId: ex.truckId
+            });
+          }
+          if (updatedExistingMap.has(exIdx)) {
+            return updatedExistingMap.get(exIdx).updatedRow;
+          }
+          return { ...ex };
+        });
+
+        // Append all truly new lines from the Excel sheet
+        incomingRows.forEach((inc, incIdx) => {
+          if (!usedIncomingIndices.has(incIdx)) {
+            dayMergedList.push({ ...inc });
+            summary.addedCount += 1;
+            summary.items.push({
+              type: "added",
+              day,
+              lineNo: dayMergedList.length,
+              customer: inc.customer,
+              units: inc.units,
+              typeCode: inc.type,
+              bookingNo: inc.bookingNo,
+              exGrid: inc.exGrid,
+              comment: inc.comment
+            });
+          }
+        });
+
+        mergedDays[day] = dayMergedList.map((r, idx) => ({ ...r, lineNo: idx + 1 }));
+      });
+
+      return { mergedDays, summary };
     };
 
     function App() {
@@ -240,6 +503,20 @@
         };
       });
 
+      const [currentWorkbookName, setCurrentWorkbookName] = useState(() => {
+        try {
+          const cached = localStorage.getItem(LOCAL_STORAGE_KEY);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (parsed.currentWorkbookName) return parsed.currentWorkbookName;
+          }
+        } catch (e) {}
+        return "";
+      });
+
+      // Import Comparison & Merge Modal State
+      const [pendingImportReview, setPendingImportReview] = useState(null);
+
       const [notification, setNotification] = useState("");
       const [isEditingNotice, setIsEditingNotice] = useState(false);
       const [tempNotice, setTempNotice] = useState("");
@@ -281,12 +558,17 @@
           overrides.notification !== undefined ? overrides.notification : notification;
         const nextUsers =
           overrides.users !== undefined ? overrides.users : users;
+        const nextWorkbookName =
+          overrides.currentWorkbookName !== undefined
+            ? overrides.currentWorkbookName
+            : currentWorkbookName;
 
         const payload = {
           daysData: nextDaysData,
           headerMetadata: nextHeaders,
           notification: nextNotice,
           users: nextUsers,
+          currentWorkbookName: nextWorkbookName,
           activityLogs: prunedLogs,
           importSnapshots: prunedSnapshots,
           lastUpdated: new Date().toISOString()
@@ -335,6 +617,7 @@
               }
               if (val.headerMetadata) setHeaderMetadata(val.headerMetadata);
               if (val.notification !== undefined) setNotification(val.notification);
+              if (val.currentWorkbookName !== undefined) setCurrentWorkbookName(val.currentWorkbookName);
               if (Array.isArray(val.users) && val.users.length > 0) {
                 setUsers(val.users);
               }
@@ -582,9 +865,10 @@
         const d = new Date(ms);
         const day = String(d.getDate()).padStart(2, "0");
         const month = d.toLocaleString("en-NZ", { month: "short" });
+        const year = d.getFullYear();
         const hrs = String(d.getHours()).padStart(2, "0");
         const mins = String(d.getMinutes()).padStart(2, "0");
-        return `${day} ${month} ${hrs}${mins}`;
+        return `${day} ${month} ${year} • ${hrs}:${mins}`;
       };
 
       const createLogEntry = (day, lineNo, action, details, meta = {}, changeInfo = null) => {
@@ -822,37 +1106,22 @@
         setDragOverRowIndex(null);
       };
 
+      // =======================================================================
+      // SMART IMPORT PARSING, COMPARISON & MERGE / OVERWRITE EXECUTION
+      // =======================================================================
       const handleImportExcel = (e) => {
         const file = e.target.files[0];
         if (!file) return;
-        const fileName = file.name;
+        const importedFileName = file.name;
 
         const reader = new FileReader();
         reader.onload = (evt) => {
           const data = new Uint8Array(evt.target.result);
           const workbook = XLSX.read(data, { type: "array" });
 
-          const hasExistingRows = DAYS.some((d) => (sheetData[d] || []).filter(isRowValid).length > 0);
-          let updatedSnapshots = pruneOlderThanSevenDays(importSnapshots);
-
-          if (hasExistingRows) {
-            const totalActiveRows = DAYS.reduce((acc, d) => acc + (sheetData[d] || []).filter(isRowValid).length, 0);
-            const now = Date.now();
-            const backupSnapshot = {
-              id: `snap-${now}`,
-              timestamp: now,
-              formattedTime: formatLogTimestamp(now),
-              label: `Auto-Backup before importing "${fileName}"`,
-              rowCount: totalActiveRows,
-              daysData: JSON.parse(JSON.stringify(sheetData)),
-              headerMetadata: JSON.parse(JSON.stringify(headerMetadata))
-            };
-            updatedSnapshots = [backupSnapshot, ...updatedSnapshots];
-          }
-
-          const newSheetData = createEmptyDaysObject();
+          const parsedIncomingDays = createEmptyDaysObject();
           const newHeaderMeta = { ...headerMetadata };
-          let importedCount = 0;
+          let totalIncomingRows = 0;
 
           workbook.SheetNames.forEach((sheetName) => {
             const matchedDay = DAYS.find((d) => sheetName.toLowerCase().includes(d.toLowerCase()));
@@ -882,35 +1151,106 @@
                 }))
                 .filter(isRowValid);
 
-              importedCount += parsedRows.length;
-              newSheetData[matchedDay] = parsedRows;
+              totalIncomingRows += parsedRows.length;
+              parsedIncomingDays[matchedDay] = parsedRows;
             }
           });
 
-          const importLog = createLogEntry(
-            "All Days",
-            "-",
-            "Excel Imported",
-            `Imported "${fileName}" (${importedCount} active lines across week)`
-          );
-          const updatedLogs = [importLog, ...pruneOlderThanSevenDays(activityLogs)];
+          const hasExistingRows = DAYS.some((d) => (sheetData[d] || []).filter(isRowValid).length > 0);
 
-          setSheetData(newSheetData);
-          setHeaderMetadata(newHeaderMeta);
-          setImportSnapshots(updatedSnapshots);
-          setActivityLogs(updatedLogs);
-          initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
-
-          persistState({
-            daysData: newSheetData,
-            headerMetadata: newHeaderMeta,
-            activityLogs: updatedLogs,
-            importSnapshots: updatedSnapshots
-          });
+          if (!hasExistingRows) {
+            // Fresh import when sheet is currently empty
+            applyImportAction("overwrite", {
+              importedFileName,
+              incomingDays: parsedIncomingDays,
+              mergedDays: parsedIncomingDays,
+              newHeaderMeta,
+              totalIncomingRows,
+              summary: { addedCount: totalIncomingRows, updatedCount: 0, unchangedCount: 0, removedCount: 0, items: [] }
+            });
+          } else {
+            // Compute diff and show Import Comparison & Merge Modal
+            const { mergedDays, summary } = computeImportAnalysis(sheetData, parsedIncomingDays);
+            setPendingImportReview({
+              importedFileName,
+              incomingDays: parsedIncomingDays,
+              mergedDays,
+              newHeaderMeta,
+              totalIncomingRows,
+              summary
+            });
+          }
 
           e.target.value = "";
         };
         reader.readAsArrayBuffer(file);
+      };
+
+      const applyImportAction = (mode, reviewPayload) => {
+        if (!reviewPayload) return;
+        const {
+          importedFileName,
+          incomingDays,
+          mergedDays,
+          newHeaderMeta,
+          totalIncomingRows,
+          summary
+        } = reviewPayload;
+
+        const hasExistingRows = DAYS.some((d) => (sheetData[d] || []).filter(isRowValid).length > 0);
+        let updatedSnapshots = pruneOlderThanSevenDays(importSnapshots);
+
+        if (hasExistingRows) {
+          const totalActiveRows = DAYS.reduce((acc, d) => acc + (sheetData[d] || []).filter(isRowValid).length, 0);
+          const now = Date.now();
+          const backedUpSheetTitle = currentWorkbookName || "Previous Release Sheet";
+          const backupSnapshot = {
+            id: `snap-${now}`,
+            timestamp: now,
+            formattedTime: formatLogTimestamp(now),
+            sheetName: backedUpSheetTitle,
+            importedBy: currentUser ? currentUser.username : "Unknown",
+            label:
+              mode === "merge"
+                ? `Backed up before merging changes from "${importedFileName}"`
+                : `Backed up before overwriting with "${importedFileName}"`,
+            rowCount: totalActiveRows,
+            daysData: JSON.parse(JSON.stringify(sheetData)),
+            headerMetadata: JSON.parse(JSON.stringify(headerMetadata))
+          };
+          updatedSnapshots = [backupSnapshot, ...updatedSnapshots];
+        }
+
+        const finalDaysData = mode === "merge" ? mergedDays : incomingDays;
+
+        const logDescription =
+          mode === "merge"
+            ? `Merged "${importedFileName}" (+${summary.addedCount} added, ${summary.updatedCount} updated; existing yard entries preserved)`
+            : `Overwrote sheet with "${importedFileName}" (${totalIncomingRows} active lines across week)`;
+
+        const importLog = createLogEntry(
+          "All Days",
+          "-",
+          mode === "merge" ? "Excel Merged" : "Excel Overwritten",
+          logDescription
+        );
+        const updatedLogs = [importLog, ...pruneOlderThanSevenDays(activityLogs)];
+
+        setSheetData(finalDaysData);
+        setHeaderMetadata(newHeaderMeta);
+        setCurrentWorkbookName(importedFileName);
+        setImportSnapshots(updatedSnapshots);
+        setActivityLogs(updatedLogs);
+        setPendingImportReview(null);
+        initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(finalDaysData));
+
+        persistState({
+          daysData: finalDaysData,
+          headerMetadata: newHeaderMeta,
+          currentWorkbookName: importedFileName,
+          activityLogs: updatedLogs,
+          importSnapshots: updatedSnapshots
+        });
       };
 
       const handleRestoreSnapshot = (snapshot) => {
@@ -918,11 +1258,14 @@
 
         const now = Date.now();
         const currentTotal = DAYS.reduce((acc, d) => acc + (sheetData[d] || []).filter(isRowValid).length, 0);
+        const restoredSheetTitle = snapshot.sheetName || "Backed Up Sheet";
         const safetyBackup = {
           id: `snap-${now}`,
           timestamp: now,
           formattedTime: formatLogTimestamp(now),
-          label: `Auto-Backup before restoring snapshot from ${snapshot.formattedTime}`,
+          sheetName: currentWorkbookName || "Previous Release Sheet",
+          importedBy: currentUser ? currentUser.username : "Unknown",
+          label: `Backed up before restoring "${restoredSheetTitle}"`,
           rowCount: currentTotal,
           daysData: JSON.parse(JSON.stringify(sheetData)),
           headerMetadata: JSON.parse(JSON.stringify(headerMetadata))
@@ -932,7 +1275,7 @@
           "All Days",
           "-",
           "Snapshot Restored",
-          `Restored weekly backup from ${snapshot.formattedTime} (${snapshot.rowCount} lines)`
+          `Restored "${restoredSheetTitle}" from ${snapshot.formattedTime} (${snapshot.rowCount} lines)`
         );
 
         const normalizedRestored = normalizeDaysData(snapshot.daysData);
@@ -941,6 +1284,7 @@
 
         setSheetData(normalizedRestored);
         if (snapshot.headerMetadata) setHeaderMetadata(snapshot.headerMetadata);
+        setCurrentWorkbookName(restoredSheetTitle);
         setImportSnapshots(updatedSnapshots);
         setActivityLogs(updatedLogs);
         initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(normalizedRestored));
@@ -948,6 +1292,7 @@
         persistState({
           daysData: normalizedRestored,
           headerMetadata: snapshot.headerMetadata || headerMetadata,
+          currentWorkbookName: restoredSheetTitle,
           activityLogs: updatedLogs,
           importSnapshots: updatedSnapshots
         });
@@ -1197,7 +1542,6 @@
         );
       });
 
-      // Automatically group when searching OR when Group Mode toggle is enabled
       const isGroupedViewActive = logSearchQuery.trim().length > 0 || forceGroupMode;
 
       const groupedLogEntries = (() => {
@@ -1246,7 +1590,6 @@
         return Array.from(groupsMap.values());
       })();
 
-      // Reusable Visual Log Card with Full-Line Snapshot
       const renderFullLineLogCard = (log) => {
         const snap = log.lineSnapshot;
         const gridKey = snap && snap.exGrid ? snap.exGrid.trim().toUpperCase() : "";
@@ -1257,7 +1600,6 @@
             key={log.id}
             className="bg-gray-950/90 border border-gray-800 rounded-xl p-3.5 space-y-2.5"
           >
-            {/* Card Header: Timestamp, User, Day/Line, Action Summary */}
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-mono text-emerald-400 font-semibold">
@@ -1276,7 +1618,6 @@
               </span>
             </div>
 
-            {/* Complete Line Snapshot Strip (Visualizes everything together) */}
             {snap && (
               <div className="grid grid-cols-2 sm:grid-cols-5 lg:grid-cols-10 gap-1.5 pt-2 border-t border-gray-800/70">
                 {SNAPSHOT_COLUMNS.map((col) => {
@@ -1356,6 +1697,14 @@
                     {currentUser.role}
                   </span>
                 </span>
+                {currentWorkbookName && (
+                  <>
+                    <span className="text-gray-600">|</span>
+                    <span className="text-xs text-gray-400">
+                      Active File: <span className="text-gray-200 font-mono">{currentWorkbookName}</span>
+                    </span>
+                  </>
+                )}
               </div>
             </div>
 
@@ -1718,6 +2067,206 @@
             </div>
           </main>
 
+          {/* ================================================================= */}
+          {/* IMPORT REVIEW & MERGE / OVERWRITE MODAL                           */}
+          {/* ================================================================= */}
+          {pendingImportReview && (
+            <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
+              <div className="bg-gray-900 border border-gray-800 rounded-2xl w-full max-w-4xl max-h-[88vh] flex flex-col shadow-2xl">
+                <div className="px-6 py-4 border-b border-gray-800 flex items-center justify-between">
+                  <div>
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-emerald-400">
+                      Import Comparison & Merge Preview
+                    </span>
+                    <h3 className="text-lg font-bold text-white mt-0.5 font-mono">
+                      {pendingImportReview.importedFileName}
+                    </h3>
+                  </div>
+                  <button
+                    onClick={() => setPendingImportReview(null)}
+                    className="text-gray-400 hover:text-white text-lg px-2"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                {/* Change Summary Counters */}
+                <div className="px-6 py-3.5 bg-gray-950/70 border-b border-gray-800 grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <div className="bg-emerald-950/40 border border-emerald-800/50 rounded-lg px-3 py-2">
+                    <div className="text-[11px] text-emerald-400 uppercase font-semibold">New Lines</div>
+                    <div className="text-xl font-bold text-white font-mono">
+                      +{pendingImportReview.summary.addedCount}
+                    </div>
+                  </div>
+                  <div className="bg-amber-950/40 border border-amber-800/50 rounded-lg px-3 py-2">
+                    <div className="text-[11px] text-amber-400 uppercase font-semibold">Updated Lines</div>
+                    <div className="text-xl font-bold text-white font-mono">
+                      {pendingImportReview.summary.updatedCount}
+                    </div>
+                  </div>
+                  <div className="bg-gray-900 border border-gray-800 rounded-lg px-3 py-2">
+                    <div className="text-[11px] text-gray-400 uppercase font-semibold">Unchanged</div>
+                    <div className="text-xl font-bold text-gray-200 font-mono">
+                      {pendingImportReview.summary.unchangedCount}
+                    </div>
+                  </div>
+                  <div className="bg-rose-950/30 border border-rose-800/40 rounded-lg px-3 py-2">
+                    <div className="text-[11px] text-rose-400 uppercase font-semibold">Not in New File</div>
+                    <div className="text-xl font-bold text-gray-200 font-mono">
+                      {pendingImportReview.summary.removedCount}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Detailed List of Detected Changes */}
+                <div className="flex-1 overflow-auto p-6 space-y-2.5">
+                  {pendingImportReview.summary.items.length === 0 ? (
+                    <div className="text-center py-10 text-gray-400 text-sm">
+                      No differences found between this Excel file and the current schedule ({pendingImportReview.summary.unchangedCount} identical lines).
+                    </div>
+                  ) : (
+                    pendingImportReview.summary.items.map((item, idx) => {
+                      if (item.type === "added") {
+                        return (
+                          <div
+                            key={idx}
+                            className="bg-emerald-950/25 border border-emerald-800/50 rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs"
+                          >
+                            <div className="flex flex-wrap items-center gap-2.5">
+                              <span className="px-2 py-0.5 rounded bg-emerald-600 text-white font-bold uppercase text-[10px]">
+                                + New Line
+                              </span>
+                              <span className="font-semibold text-emerald-300">{item.day}</span>
+                              <span className="text-white font-bold">{item.customer || "No Customer"}</span>
+                              {item.bookingNo && (
+                                <span className="font-mono text-gray-300 bg-gray-900 px-2 py-0.5 rounded border border-gray-800">
+                                  Bkg: {item.bookingNo}
+                                </span>
+                              )}
+                              {item.typeCode && (
+                                <span className="font-mono text-gray-300">{item.units}x {item.typeCode}</span>
+                              )}
+                              {item.exGrid && (
+                                <span
+                                  className={`font-mono font-bold px-2 py-0.5 rounded border uppercase ${
+                                    GRID_COLOR_MAP[item.exGrid.toUpperCase()] || DEFAULT_GRID_STYLE
+                                  }`}
+                                >
+                                  {item.exGrid}
+                                </span>
+                              )}
+                            </div>
+                            <span className="text-emerald-400/90 text-[11px]">
+                              Will be added to {item.day}
+                            </span>
+                          </div>
+                        );
+                      }
+
+                      if (item.type === "updated") {
+                        return (
+                          <div
+                            key={idx}
+                            className="bg-amber-950/25 border border-amber-800/50 rounded-lg px-4 py-3 space-y-2 text-xs"
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex flex-wrap items-center gap-2.5">
+                                <span className="px-2 py-0.5 rounded bg-amber-600 text-white font-bold uppercase text-[10px]">
+                                  ~ Updated
+                                </span>
+                                <span className="font-semibold text-amber-300">
+                                  {item.day} Line #{item.lineNo}
+                                </span>
+                                <span className="text-white font-bold">{item.customer}</span>
+                                {item.ctnReleased && (
+                                  <span className="font-mono text-emerald-300 bg-emerald-950/70 px-2 py-0.5 rounded border border-emerald-800/50">
+                                    Keeps Ctn: {item.ctnReleased}
+                                  </span>
+                                )}
+                                {item.truckId && (
+                                  <span className="font-mono text-gray-300 bg-gray-900 px-2 py-0.5 rounded border border-gray-800">
+                                    Keeps Truck: {item.truckId}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+
+                            <div className="flex flex-wrap gap-2 pt-1">
+                              {item.diffs.map((d, dIdx) => (
+                                <div
+                                  key={dIdx}
+                                  className="bg-gray-950 border border-amber-800/40 rounded px-2.5 py-1 flex items-center gap-2"
+                                >
+                                  <span className="text-gray-400 font-semibold">{d.label}:</span>
+                                  <span className="text-rose-300 line-through font-mono">{d.oldVal}</span>
+                                  <span className="text-gray-500">→</span>
+                                  <span className="text-emerald-300 font-bold font-mono">{d.newVal}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div
+                          key={idx}
+                          className="bg-rose-950/20 border border-rose-800/40 rounded-lg px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs"
+                        >
+                          <div className="flex flex-wrap items-center gap-2.5">
+                            <span className="px-2 py-0.5 rounded bg-rose-900/80 text-rose-200 font-bold uppercase text-[10px]">
+                              - Missing in New File
+                            </span>
+                            <span className="font-semibold text-gray-300">
+                              {item.day} Line #{item.lineNo}
+                            </span>
+                            <span className="text-white font-medium">{item.customer || "No Customer"}</span>
+                            {item.bookingNo && <span className="font-mono text-gray-400">Bkg: {item.bookingNo}</span>}
+                            {item.ctnReleased && (
+                              <span className="font-mono text-emerald-300">Ctn: {item.ctnReleased}</span>
+                            )}
+                          </div>
+                          <span className="text-gray-400 text-[11px]">
+                            Kept if Merging • Removed if Overwriting
+                          </span>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+
+                {/* Action Footer: Cancel, Overwrite Entire Sheet, or Merge Changes Only */}
+                <div className="px-6 py-4 bg-gray-950/80 border-t border-gray-800 flex flex-wrap items-center justify-between gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setPendingImportReview(null)}
+                    className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs font-semibold rounded-lg transition"
+                  >
+                    Cancel Import
+                  </button>
+
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => applyImportAction("overwrite", pendingImportReview)}
+                      className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold rounded-lg transition"
+                    >
+                      Overwrite Entire Sheet
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => applyImportAction("merge", pendingImportReview)}
+                      className="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg transition shadow-lg shadow-emerald-900/30"
+                    >
+                      Merge Changes Only (Keep Current Yard Info)
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Comment Pop-out Modal */}
           {commentModal.isOpen && (
             <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
@@ -2014,22 +2563,28 @@
                       No backup snapshots stored yet. Whenever an Excel sheet is imported, the previous sheet is automatically backed up here for 7 days.
                     </div>
                   ) : (
+                    /* IMPORT BACKUPS TAB WITH EXCEL FILENAME + DATE & TIME */
                     <div className="space-y-3">
                       {importSnapshots.map((snap) => (
                         <div
                           key={snap.id}
                           className="bg-gray-950/80 border border-gray-800 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4"
                         >
-                          <div>
-                            <div className="flex items-center gap-2 mb-1">
-                              <span className="font-mono text-xs text-amber-400 font-semibold">
+                          <div className="space-y-1">
+                            <div className="flex flex-wrap items-center gap-2.5">
+                              <span className="text-sm font-bold text-white font-mono">
+                                {snap.sheetName || "Previous Release Sheet"}
+                              </span>
+                              <span className="font-mono text-xs bg-amber-950/70 text-amber-300 border border-amber-800/50 px-2.5 py-0.5 rounded font-semibold">
                                 {snap.formattedTime}
                               </span>
                               <span className="text-xs bg-gray-800 text-gray-300 px-2 py-0.5 rounded">
                                 {snap.rowCount} Total Lines
                               </span>
                             </div>
-                            <p className="text-sm text-gray-200">{snap.label}</p>
+                            <p className="text-xs text-gray-400">
+                              {snap.label} {snap.importedBy ? `by ${snap.importedBy}` : ""}
+                            </p>
                           </div>
                           <button
                             onClick={() => handleRestoreSnapshot(snap)}
