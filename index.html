@@ -82,7 +82,7 @@
 
     const DOOR_OPTIONS = ["Forward", "Rear", "Passengers", "Drivers"];
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v2";
+    const LOCAL_STORAGE_KEY = "container_release_sheet_cache_v3";
     const SESSION_STORAGE_KEY = "container_release_active_user_v1";
     const DEFAULT_PIN = "1111";
 
@@ -127,6 +127,19 @@
       doors: "Doors",
       comment: "Comment"
     };
+
+    const SNAPSHOT_COLUMNS = [
+      { key: "customer", label: "Customer" },
+      { key: "units", label: "Units" },
+      { key: "type", label: "Type" },
+      { key: "bookingNo", label: "Booking #" },
+      { key: "exGrid", label: "Ex Grid" },
+      { key: "ctnReleased", label: "Ctn # Released" },
+      { key: "truckId", label: "Truck ID" },
+      { key: "time", label: "Time" },
+      { key: "doors", label: "Doors" },
+      { key: "comment", label: "Comments" }
+    ];
 
     const createEmptyDaysObject = () => ({
       Monday: [],
@@ -240,6 +253,7 @@
       const [isLogModalOpen, setIsLogModalOpen] = useState(false);
       const [logModalTab, setLogModalTab] = useState("edits");
       const [logSearchQuery, setLogSearchQuery] = useState("");
+      const [forceGroupMode, setForceGroupMode] = useState(false);
       
       const initialLoadSnapshotRef = useRef({});
       const fileInputRef = useRef(null);
@@ -250,7 +264,6 @@
         return items.filter((item) => item && item.timestamp && item.timestamp >= cutoff);
       };
 
-      // Save to both localStorage and Firebase Realtime Database
       const persistState = (overrides = {}) => {
         const prunedLogs = pruneOlderThanSevenDays(
           overrides.activityLogs !== undefined ? overrides.activityLogs : activityLogs
@@ -296,7 +309,6 @@
         }
       };
 
-      // Realtime Database Listener
       useEffect(() => {
         if (!db) return;
 
@@ -333,7 +345,6 @@
                 localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(val));
               } catch (e) {}
             } else {
-              // Seed initial Admin user in Firebase if empty
               persistState({ users: INITIAL_USERS });
             }
           },
@@ -349,7 +360,6 @@
         };
       }, []);
 
-      // Keep active session synced with user list (e.g. if deleted or role changed)
       useEffect(() => {
         if (!currentUser) return;
         const freshUser = users.find((u) => u.id === currentUser.id);
@@ -390,7 +400,6 @@
           return;
         }
 
-        // Force personalized PIN setup if using default 1111 PIN
         if (matchedUser.pin === DEFAULT_PIN || matchedUser.mustChangePin) {
           setPendingPinSetupUser(matchedUser);
           setNewPersonalPin("");
@@ -467,7 +476,6 @@
           return;
         }
 
-        // Case-insensitive duplicate check
         const duplicateExists = users.some(
           (u) => u.username.toLowerCase() === cleanName.toLowerCase()
         );
@@ -569,7 +577,7 @@
         persistState({ users: updatedUsers, activityLogs: updatedLogs });
       };
 
-      // --- LOGGING & TABLE HANDLERS ---
+      // --- LOGGING & FULL-LINE SNAPSHOT HELPERS ---
       const formatLogTimestamp = (ms) => {
         const d = new Date(ms);
         const day = String(d.getDate()).padStart(2, "0");
@@ -579,8 +587,30 @@
         return `${day} ${month} ${hrs}${mins}`;
       };
 
-      const createLogEntry = (day, lineNo, action, details, meta = {}) => {
+      const createLogEntry = (day, lineNo, action, details, meta = {}, changeInfo = null) => {
         const now = Date.now();
+        const hasRowSnapshot =
+          meta &&
+          (meta.customer !== undefined ||
+            meta.bookingNo !== undefined ||
+            meta.ctnReleased !== undefined ||
+            meta.exGrid !== undefined);
+
+        const lineSnapshot = hasRowSnapshot
+          ? {
+              customer: meta.customer || "",
+              units: meta.units || "1",
+              type: meta.type || "",
+              bookingNo: meta.bookingNo || "",
+              exGrid: meta.exGrid || "",
+              ctnReleased: meta.ctnReleased || "",
+              truckId: meta.truckId || "",
+              time: meta.time || "",
+              doors: meta.doors || "Forward",
+              comment: meta.comment || ""
+            }
+          : null;
+
         return {
           id: `${now}-${Math.random().toString(36).substr(2, 5)}`,
           timestamp: now,
@@ -594,7 +624,11 @@
           customer: meta.customer || "",
           bookingNo: meta.bookingNo || "",
           ctnReleased: meta.ctnReleased || "",
-          truckId: meta.truckId || ""
+          truckId: meta.truckId || "",
+          lineSnapshot,
+          changedField: changeInfo ? changeInfo.field : null,
+          oldValue: changeInfo ? changeInfo.oldVal : null,
+          newValue: changeInfo ? changeInfo.newVal : null
         };
       };
 
@@ -677,7 +711,14 @@
         if (oldVal !== newVal) {
           const label = FIELD_LABELS[field] || field;
           const summary = `${label}: "${oldVal || "Empty"}" → "${newVal || "Cleared"}"`;
-          const logItem = createLogEntry(activeDay, rowIndex + 1, "Field Updated", summary, updatedDayData[rowIndex]);
+          const logItem = createLogEntry(
+            activeDay,
+            rowIndex + 1,
+            "Field Updated",
+            summary,
+            updatedDayData[rowIndex],
+            { field, oldVal, newVal }
+          );
           updatedLogs = [logItem, ...pruneOlderThanSevenDays(activityLogs)];
           setActivityLogs(updatedLogs);
           initialLoadSnapshotRef.current = JSON.parse(JSON.stringify(newSheetData));
@@ -709,7 +750,7 @@
         };
         const updatedList = [...currentList, newRow];
         const newSheetData = { ...sheetData, [activeDay]: updatedList };
-        const logItem = createLogEntry(activeDay, updatedList.length, "Line Added", "Added new schedule row");
+        const logItem = createLogEntry(activeDay, updatedList.length, "Line Added", "Added new schedule row", newRow);
         const updatedLogs = [logItem, ...pruneOlderThanSevenDays(activityLogs)];
 
         setSheetData(newSheetData);
@@ -1138,6 +1179,7 @@
       const filteredLogs = activityLogs.filter((log) => {
         if (!logSearchQuery.trim()) return true;
         const q = logSearchQuery.toLowerCase();
+        const snap = log.lineSnapshot || {};
         return (
           (log.username && log.username.toLowerCase().includes(q)) ||
           (log.day && log.day.toLowerCase().includes(q)) ||
@@ -1147,9 +1189,148 @@
           (log.bookingNo && log.bookingNo.toLowerCase().includes(q)) ||
           (log.ctnReleased && log.ctnReleased.toLowerCase().includes(q)) ||
           (log.truckId && log.truckId.toLowerCase().includes(q)) ||
+          (snap.customer && snap.customer.toLowerCase().includes(q)) ||
+          (snap.bookingNo && snap.bookingNo.toLowerCase().includes(q)) ||
+          (snap.ctnReleased && snap.ctnReleased.toLowerCase().includes(q)) ||
+          (snap.truckId && snap.truckId.toLowerCase().includes(q)) ||
           (log.formattedTime && log.formattedTime.toLowerCase().includes(q))
         );
       });
+
+      // Automatically group when searching OR when Group Mode toggle is enabled
+      const isGroupedViewActive = logSearchQuery.trim().length > 0 || forceGroupMode;
+
+      const groupedLogEntries = (() => {
+        const groupsMap = new Map();
+        filteredLogs.forEach((log) => {
+          const snap = log.lineSnapshot || {};
+          const booking = (snap.bookingNo || log.bookingNo || "").trim().toUpperCase();
+          const customer = (snap.customer || log.customer || "").trim();
+          const day = log.day || "General";
+
+          let groupKey = "";
+          let groupTitle = "";
+          let groupSubtitle = "";
+
+          if (booking || customer) {
+            groupKey = `${day}::${booking || "NO-BKG"}::${customer.toLowerCase() || "no-cust"}`;
+            groupTitle = booking ? `Booking # ${booking}` : customer;
+            groupSubtitle = [customer && booking ? customer : "", day !== "All Days" && day !== "System" ? day : ""]
+              .filter(Boolean)
+              .join(" • ");
+          } else {
+            groupKey = `SYSTEM::${log.action}`;
+            groupTitle = `${log.action} (${day})`;
+            groupSubtitle = "System / Workbook Activity";
+          }
+
+          if (!groupsMap.has(groupKey)) {
+            groupsMap.set(groupKey, {
+              key: groupKey,
+              title: groupTitle,
+              subtitle: groupSubtitle,
+              latestCtn: snap.ctnReleased || log.ctnReleased || "",
+              latestGrid: snap.exGrid || "",
+              logs: []
+            });
+          }
+          const grp = groupsMap.get(groupKey);
+          grp.logs.push(log);
+          if (!grp.latestCtn && (snap.ctnReleased || log.ctnReleased)) {
+            grp.latestCtn = snap.ctnReleased || log.ctnReleased;
+          }
+          if (!grp.latestGrid && snap.exGrid) {
+            grp.latestGrid = snap.exGrid;
+          }
+        });
+        return Array.from(groupsMap.values());
+      })();
+
+      // Reusable Visual Log Card with Full-Line Snapshot
+      const renderFullLineLogCard = (log) => {
+        const snap = log.lineSnapshot;
+        const gridKey = snap && snap.exGrid ? snap.exGrid.trim().toUpperCase() : "";
+        const gridColorStyle = GRID_COLOR_MAP[gridKey] || DEFAULT_GRID_STYLE;
+
+        return (
+          <div
+            key={log.id}
+            className="bg-gray-950/90 border border-gray-800 rounded-xl p-3.5 space-y-2.5"
+          >
+            {/* Card Header: Timestamp, User, Day/Line, Action Summary */}
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-emerald-400 font-semibold">
+                  {log.formattedTime}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800/60 font-semibold">
+                  {log.username || "Unknown"}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-gray-800 text-gray-300 font-medium">
+                  {log.day} {log.lineNo !== "-" ? `Line #${log.lineNo}` : ""}
+                </span>
+                <span className="text-gray-200 font-medium">{log.details}</span>
+              </div>
+              <span className="text-[11px] px-2 py-0.5 rounded bg-gray-900 text-gray-400 border border-gray-800">
+                {log.action}
+              </span>
+            </div>
+
+            {/* Complete Line Snapshot Strip (Visualizes everything together) */}
+            {snap && (
+              <div className="grid grid-cols-2 sm:grid-cols-5 lg:grid-cols-10 gap-1.5 pt-2 border-t border-gray-800/70">
+                {SNAPSHOT_COLUMNS.map((col) => {
+                  const isEditedField = log.changedField === col.key;
+                  const cellVal = snap[col.key];
+
+                  return (
+                    <div
+                      key={col.key}
+                      className={`rounded-lg px-2 py-1.5 border text-xs transition ${
+                        isEditedField
+                          ? "bg-emerald-950/40 border-emerald-500/70 ring-1 ring-emerald-500/30"
+                          : "bg-gray-900/70 border-gray-800/80"
+                      }`}
+                    >
+                      <div className="text-[10px] uppercase tracking-wider text-gray-500 flex items-center justify-between">
+                        <span>{col.label}</span>
+                        {isEditedField && (
+                          <span className="text-[9px] font-bold text-emerald-400">EDITED</span>
+                        )}
+                      </div>
+
+                      {col.key === "exGrid" && cellVal ? (
+                        <div className={`mt-0.5 inline-block px-1.5 py-0.2 rounded border text-[11px] font-bold font-mono uppercase ${gridColorStyle}`}>
+                          {cellVal}
+                        </div>
+                      ) : (
+                        <div
+                          className={`mt-0.5 font-mono truncate ${
+                            isEditedField
+                              ? "text-emerald-200 font-semibold"
+                              : cellVal
+                              ? "text-gray-200"
+                              : "text-gray-600 italic"
+                          }`}
+                          title={cellVal || "Empty"}
+                        >
+                          {cellVal || "—"}
+                        </div>
+                      )}
+
+                      {isEditedField && (
+                        <div className="text-[10px] text-amber-400/90 truncate mt-0.5" title={`Previous: ${log.oldValue || "Empty"}`}>
+                          Was: {log.oldValue || "Empty"}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      };
 
       return (
         <div className="flex-1 flex flex-col">
@@ -1696,11 +1877,13 @@
           {/* 7-Day Activity Log & Archive Snapshot Modal */}
           {isLogModalOpen && (
             <div className="fixed inset-0 bg-black/75 flex items-center justify-center p-4 z-50">
-              <div className="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-4xl max-h-[85vh] flex flex-col shadow-2xl">
+              <div className="bg-gray-900 border border-gray-800 rounded-xl w-full max-w-6xl max-h-[88vh] flex flex-col shadow-2xl">
                 <div className="px-6 py-4 border-b border-gray-800 flex items-center justify-between">
                   <div>
                     <h3 className="text-lg font-bold text-white">7-Day Activity Log & Weekly Snapshots</h3>
-                    <p className="text-xs text-gray-400">Tracks which user made each edit. Records retained for 7 days.</p>
+                    <p className="text-xs text-gray-400">
+                      Every edit captures the full line snapshot. Searching by Booking #, Customer, or User automatically groups edits together.
+                    </p>
                   </div>
                   <button
                     onClick={() => setIsLogModalOpen(false)}
@@ -1735,13 +1918,38 @@
                   </div>
 
                   {logModalTab === "edits" && (
-                    <input
-                      type="text"
-                      value={logSearchQuery}
-                      onChange={(e) => setLogSearchQuery(e.target.value)}
-                      placeholder="Filter by User, Ctn #, Booking, Truck..."
-                      className="bg-gray-900 border border-gray-700 focus:border-emerald-500 rounded-lg px-3 py-1.5 text-xs text-gray-100 w-72 focus:outline-none"
-                    />
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setForceGroupMode(!forceGroupMode)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition ${
+                          isGroupedViewActive
+                            ? "bg-emerald-950/70 text-emerald-300 border-emerald-700/60"
+                            : "bg-gray-900 text-gray-400 border-gray-700 hover:text-gray-200"
+                        }`}
+                      >
+                        {isGroupedViewActive ? "Grouped View: ON" : "Group by Booking/Customer"}
+                      </button>
+
+                      <div className="relative flex items-center">
+                        <input
+                          type="text"
+                          value={logSearchQuery}
+                          onChange={(e) => setLogSearchQuery(e.target.value)}
+                          placeholder="Search Booking #, Customer, User, Ctn #..."
+                          className="bg-gray-900 border border-gray-700 focus:border-emerald-500 rounded-lg px-3 py-1.5 text-xs text-gray-100 w-72 focus:outline-none pr-7"
+                        />
+                        {logSearchQuery && (
+                          <button
+                            onClick={() => setLogSearchQuery("")}
+                            className="absolute right-2 text-gray-400 hover:text-white text-xs"
+                            title="Clear search"
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    </div>
                   )}
                 </div>
 
@@ -1749,33 +1957,56 @@
                   {logModalTab === "edits" ? (
                     filteredLogs.length === 0 ? (
                       <div className="text-center py-12 text-gray-500 text-sm">
-                        No log entries found within the last 7 days.
+                        No log entries found matching your filter within the last 7 days.
                       </div>
-                    ) : (
-                      <div className="space-y-2">
-                        {filteredLogs.map((log) => (
+                    ) : isGroupedViewActive ? (
+                      /* GROUPED VIEW BY BOOKING # / CUSTOMER */
+                      <div className="space-y-5">
+                        {groupedLogEntries.map((group) => (
                           <div
-                            key={log.id}
-                            className="bg-gray-950/80 border border-gray-800/80 rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs"
+                            key={group.key}
+                            className="bg-gray-900/70 border border-gray-800 rounded-xl overflow-hidden shadow-lg"
                           >
-                            <div className="flex items-center gap-3">
-                              <span className="font-mono text-emerald-400 font-semibold whitespace-nowrap">
-                                {log.formattedTime}
+                            <div className="bg-gray-800/70 px-4 py-3 border-b border-gray-800 flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex flex-wrap items-center gap-2.5">
+                                <span className="text-sm font-bold text-white">
+                                  {group.title}
+                                </span>
+                                {group.subtitle && (
+                                  <span className="text-xs text-gray-300">
+                                    ({group.subtitle})
+                                  </span>
+                                )}
+                                {group.latestCtn && (
+                                  <span className="text-xs font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800/60">
+                                    Ctn: {group.latestCtn}
+                                  </span>
+                                )}
+                                {group.latestGrid && (
+                                  <span
+                                    className={`text-xs font-mono font-bold px-2 py-0.5 rounded border uppercase ${
+                                      GRID_COLOR_MAP[group.latestGrid.toUpperCase()] || DEFAULT_GRID_STYLE
+                                    }`}
+                                  >
+                                    {group.latestGrid}
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-gray-950 text-emerald-400 border border-gray-700">
+                                {group.logs.length} {group.logs.length === 1 ? "Edit" : "Edits"}
                               </span>
-                              <span className="px-2 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-800/50 font-semibold">
-                                {log.username || "Unknown"}
-                              </span>
-                              <span className="px-2 py-0.5 rounded bg-gray-800 text-gray-300 font-medium">
-                                {log.day} {log.lineNo !== "-" ? `#${log.lineNo}` : ""}
-                              </span>
-                              <span className="text-gray-200">{log.details}</span>
                             </div>
-                            <div className="flex items-center gap-2 text-gray-400 font-mono">
-                              {log.customer && <span>[{log.customer}]</span>}
-                              {log.bookingNo && <span>Bkg: {log.bookingNo}</span>}
+
+                            <div className="p-3.5 space-y-2.5">
+                              {group.logs.map((log) => renderFullLineLogCard(log))}
                             </div>
                           </div>
                         ))}
+                      </div>
+                    ) : (
+                      /* CHRONOLOGICAL FULL-LINE SNAPSHOT VIEW */
+                      <div className="space-y-3">
+                        {filteredLogs.map((log) => renderFullLineLogCard(log))}
                       </div>
                     )
                   ) : importSnapshots.length === 0 ? (
